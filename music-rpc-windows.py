@@ -83,18 +83,28 @@ def _itunes_search(name: str, artist: str, album: str) -> list:
         return []
 
 
-def _find_result(results: list, name: str, album: str) -> dict | None:
+def _find_result(results: list, name: str, artist: str, album: str) -> dict | None:
     if not results:
         return None
-    if len(results) == 1:
-        return results[0]
-    name_l  = name.lower()
-    album_l = album.lower()
+    name_l   = name.lower()
+    artist_l = artist.lower()
+    album_l  = album.lower()
+    # Best: track + album + artist all match
+    exact = next(
+        (r for r in results
+         if album_l  in r.get("collectionName", "").lower()
+         and name_l  in r.get("trackName", "").lower()
+         and artist_l in r.get("artistName", "").lower()),
+        None,
+    )
+    if exact:
+        return exact
+    # Fallback: track + artist match (ignore album variant)
     return next(
         (r for r in results
-         if album_l in r.get("collectionName", "").lower()
-         and name_l  in r.get("trackName", "").lower()),
-        results[0],
+         if name_l   in r.get("trackName", "").lower()
+         and artist_l in r.get("artistName", "").lower()),
+        None,
     )
 
 
@@ -104,13 +114,13 @@ def fetch_extras(persistent_id: str, name: str, artist: str, album: str) -> dict
         return cached
 
     results = _itunes_search(name, artist, album)
-    r = _find_result(results, name, album)
+    r = _find_result(results, name, artist, album)
 
     # Retry without "(Deluxe Edition)" etc. if no result
     if not r and "(" in album:
         clean_album = album[:album.rfind("(")].strip()
         results = _itunes_search(name, artist, clean_album)
-        r = _find_result(results, name, clean_album)
+        r = _find_result(results, name, artist, clean_album)
 
     extras = {}
     if r:
