@@ -72,7 +72,7 @@ def _itunes_search(name: str, artist: str, album: str) -> list:
         "media": "music",
         "entity": "song",
         "term": f"{name} {artist} {album}",
-        "country": "JP",
+        "country": "US",
     })
     url = f"https://itunes.apple.com/search?{params}"
     try:
@@ -173,7 +173,12 @@ async def _get_track() -> dict | None:
         if not title:
             continue
 
-        # Use title+artist as persistent ID (Windows doesn't expose one)
+        # Apple Music for Windows sometimes stuffs "Artist — Album" in the artist field
+        if not album and " — " in artist:
+            artist, album = artist.split(" — ", 1)
+            artist = artist.strip()
+            album  = album.strip()
+
         persistent_id = f"{title}|{artist}|{album}"
         duration = None
         try:
