@@ -89,8 +89,13 @@ if errorlevel 1 (
 set STARTUP=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup
 set VBSFILE=%DEST%\start.vbs
 
-echo Set WshShell = CreateObject("WScript.Shell") > "%VBSFILE%"
-echo WshShell.Run Chr(34) ^& "%PYTHON%" ^& Chr(34) ^& " " ^& Chr(34) ^& "%DEST%\music-rpc-windows.py" ^& Chr(34), 0, False >> "%VBSFILE%"
+:: Strip quotes from PYTHON path for use inside VBScript string
+set PYTHON_CLEAN=%PYTHON:"=%
+
+(
+echo Set WshShell = CreateObject^("WScript.Shell"^)
+echo WshShell.Run """%PYTHON_CLEAN%"" ""%DEST%\music-rpc-windows.py""", 0, False
+) > "%VBSFILE%"
 
 echo Set oShell = CreateObject("WScript.Shell") > "%DEST%\create_shortcut.vbs"
 echo Set oLink = oShell.CreateShortcut("%STARTUP%\Apple Music RPC.lnk") >> "%DEST%\create_shortcut.vbs"
