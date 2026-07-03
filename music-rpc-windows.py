@@ -902,7 +902,7 @@ class RPCWorker:
                         log.info("Lyric: %s", lyric[:60])
                         self._last_lyric = lyric
                     wait = min(_time_until_next_lyric(self._parsed_lrc, pos),
-                               deadline - time.time())
+                               2.0, deadline - time.time())
                 else:
                     wait = min(0.5, deadline - time.time())
                 if wait <= 0:
