@@ -419,11 +419,15 @@ async def _get_track() -> dict | None:
 
         position = 0.0
         duration = 0.0
+        def _ticks_to_sec(v) -> float:
+            if hasattr(v, "total_seconds"):
+                return v.total_seconds()
+            return v / 1e7
         try:
             tl = session.get_timeline_properties()
             if tl:
-                position = tl.position / 1e7
-                duration = tl.end_time / 1e7
+                position = _ticks_to_sec(tl.position)
+                duration = _ticks_to_sec(tl.end_time)
         except Exception:
             pass
 
