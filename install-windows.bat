@@ -307,7 +307,7 @@ def fetch_extras(pid: str, name: str, artist: str, album: str, country: str = "U
         extras["artistViewUrl"]     = r.get("artistViewUrl")
         extras["collectionViewUrl"] = r.get("collectionViewUrl")
         extras["trackViewUrl"]      = r.get("trackViewUrl")
-    _extras_set(cache_key, extras)
+        _extras_set(cache_key, extras)  # only cache on success
     return extras
 
 # -- Lyrics --------------------------------------------------------------------
@@ -999,20 +999,21 @@ class RPCWorker:
             except Exception as e:
                 log.error("Presence update error: %s", e)
 
-            if token and use_lyr and self._parsed_lrc and self._last_id:
-                deadline = time.time() + next_poll
-                while not self._stop.is_set() and time.time() < deadline:
-                    try:
-                        t = self._loop.run_until_complete(_get_track())
-                    except Exception:
-                        self._stop.wait(min(2.0, deadline - time.time()))
-                        continue
-                    if not t or not t["playing"]:
-                        self._stop.wait(min(2.0, deadline - time.time()))
-                        continue
-                    if t["persistent_id"] != self._last_id:
-                        break  # Song changed — exit immediately so main loop updates RPC
-                    pos = t.get("position", 0.0) - LYRIC_OFFSET
+            has_lyrics = bool(token and use_lyr and self._parsed_lrc and self._last_id)
+            deadline   = time.time() + next_poll
+            while not self._stop.is_set() and time.time() < deadline:
+                try:
+                    t = self._loop.run_until_complete(_get_track())
+                except Exception:
+                    self._stop.wait(min(2.0, deadline - time.time()))
+                    continue
+                if not t or not t["playing"]:
+                    self._stop.wait(min(2.0, deadline - time.time()))
+                    continue
+                if t["persistent_id"] != self._last_id:
+                    break
+                if has_lyrics:
+                    pos   = t.get("position", 0.0) - LYRIC_OFFSET
                     lyric = get_current_lyric(self._parsed_lrc, pos)
                     if lyric and lyric != self._last_lyric:
                         set_discord_status(token, lyric, emoji)
@@ -1020,11 +1021,11 @@ class RPCWorker:
                         self._last_lyric = lyric
                     wait = min(_time_until_next_lyric(self._parsed_lrc, pos),
                                deadline - time.time())
-                    if wait <= 0:
-                        break
-                    self._stop.wait(wait)
-            else:
-                self._stop.wait(next_poll)
+                else:
+                    wait = min(2.0, deadline - time.time())
+                if wait <= 0:
+                    break
+                self._stop.wait(wait)
 
         cfg   = self.cfg_getter()
         token = cfg.get("discord_token", "")
