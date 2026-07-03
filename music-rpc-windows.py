@@ -841,9 +841,16 @@ class RPCWorker:
                             self._parsed_lrc = None
                             self._lrc_pid    = None
                             self._last_lyric = None
+                            if token and use_lyr:
+                                clear_discord_status(token)
                     elif pid != self._last_id:
                         log.info("Playing (RPC off): %s — %s", track["title"], track["artist"])
-                        self._last_id = pid
+                        self._last_id    = pid
+                        self._parsed_lrc = None
+                        self._lrc_pid    = None
+                        self._last_lyric = None
+                        if token and use_lyr:
+                            clear_discord_status(token)
 
                     if token and use_lyr:
                         if self._lrc_pid != pid:
@@ -865,7 +872,26 @@ class RPCWorker:
             except Exception as e:
                 log.error("Presence update error: %s", e)
 
-            self._stop.wait(next_poll)
+            # Lyric micro-loop: refresh lyrics every 2s without waiting full RPC interval
+            if token and use_lyr and self._parsed_lrc and self._last_id:
+                deadline = time.time() + next_poll
+                while not self._stop.is_set() and time.time() < deadline:
+                    tick = min(2.0, deadline - time.time())
+                    if tick <= 0:
+                        break
+                    self._stop.wait(tick)
+                    try:
+                        t = self._loop.run_until_complete(_get_track())
+                    except Exception:
+                        continue
+                    if t and t["playing"] and t["persistent_id"] == self._last_id:
+                        lyric = get_current_lyric(self._parsed_lrc, t.get("position", 0))
+                        if lyric and lyric != self._last_lyric:
+                            set_discord_status(token, lyric, emoji)
+                            log.info("Lyric: %s", lyric[:60])
+                            self._last_lyric = lyric
+            else:
+                self._stop.wait(next_poll)
 
         cfg   = self.cfg_getter()
         token = cfg.get("discord_token", "")
