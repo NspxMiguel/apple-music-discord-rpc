@@ -6,6 +6,7 @@ Based on https://github.com/NextFire/apple-music-discord-rpc
 
 import asyncio
 import json
+import math
 import time
 import sys
 import logging
@@ -40,19 +41,30 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-CLIENT_ID   = "773825528921849856"
-VERSION     = "1.3"
-BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
-CACHE_FILE  = os.path.join(BASE_DIR, "cache.sqlite3")
+CLIENT_ID        = "773825528921849856"
+VERSION          = "1.3"
+DEFAULT_TIMEOUT  = 15          # seconds — mirror original defaultTimeout
+MAX_RUNTIME      = 24 * 3600  # 24 hours, then restart to clear memory
+BASE_DIR         = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE      = os.path.join(BASE_DIR, "config.json")
+CACHE_FILE       = os.path.join(BASE_DIR, "cache.sqlite3")
 
 DEFAULT_CONFIG = {
     "discord_token": "",
     "lyrics_in_status": True,
     "lyrics_emoji": "\U0001f3b5",
-    "poll_interval": 5,
+    "poll_interval": DEFAULT_TIMEOUT,
     "start_with_windows": True,
 }
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+def _ensure_len(value: str, min_len: int = 2, max_len: int = 128) -> str:
+    """Mirror original ensureValidStringLength."""
+    if len(value) < min_len:
+        return value.ljust(min_len)
+    if len(value) > max_len:
+        return value[:max_len - 3] + "..."
+    return value
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 def load_config():
@@ -68,7 +80,7 @@ def save_config(cfg):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
-# ── SQLite cache ───────────────────────────────────────────────────────────────
+# ── SQLite cache (mirrors Deno KV) ─────────────────────────────────────────────
 def _init_db():
     con = sqlite3.connect(CACHE_FILE)
     con.execute("CREATE TABLE IF NOT EXISTS extras (id TEXT PRIMARY KEY, data TEXT, expires_at INTEGER)")
@@ -78,7 +90,7 @@ def _init_db():
 
 _db = _init_db()
 
-def _cache_get(pid):
+def _extras_get(pid: str):
     row = _db.execute("SELECT data, expires_at FROM extras WHERE id=?", (pid,)).fetchone()
     if not row:
         return None
@@ -87,68 +99,81 @@ def _cache_get(pid):
         return None
     return json.loads(data)
 
-def _cache_set(pid, extras):
+def _extras_set(pid: str, extras: dict):
     _db.execute("INSERT OR REPLACE INTO extras(id,data,expires_at) VALUES(?,?,?)",
                 (pid, json.dumps(extras), extras.get("expiresAt")))
     _db.commit()
 
-def _lyrics_get(pid):
+def _lyrics_get(pid: str):
     row = _db.execute("SELECT data FROM lyrics WHERE id=?", (pid,)).fetchone()
     return json.loads(row[0]) if row else None
 
-def _lyrics_set(pid, data):
+def _lyrics_set(pid: str, data: dict):
     _db.execute("INSERT OR REPLACE INTO lyrics(id,data) VALUES(?,?)",
                 (pid, json.dumps(data)))
     _db.commit()
 
-# ── iTunes Search ──────────────────────────────────────────────────────────────
-def _itunes_search(name, artist, album):
+# ── iTunes Search (mirrors original — JP store for coverage) ───────────────────
+def _itunes_search(name: str, artist: str, album: str) -> list:
     params = urllib.parse.urlencode({
-        "media": "music", "entity": "song",
-        "term": f"{name} {artist} {album}", "country": "US",
+        "media": "music",
+        "entity": "song",
+        "term": f"{name} {artist} {album}",
+        "country": "JP",   # original uses JP for wider coverage
     })
-    try:
-        with urllib.request.urlopen(f"https://itunes.apple.com/search?{params}", timeout=8) as r:
-            return json.loads(r.read()).get("results", [])
-    except Exception as e:
-        log.debug("iTunes error: %s", e)
-        return []
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(
+                f"https://itunes.apple.com/search?{params}", timeout=8
+            ) as r:
+                return json.loads(r.read()).get("results", [])
+        except Exception as e:
+            log.debug("iTunes attempt %d: %s", attempt + 1, e)
+            time.sleep(0.2)
+    return []
 
-def _find_result(results, name, artist, album):
+def _find_result(results: list, name: str, album: str):
+    """Mirror original findMatchingResult."""
     if not results:
         return None
-    nl, al, cll = name.lower(), artist.lower(), album.lower()
-    exact = next((r for r in results
-                  if cll in r.get("collectionName", "").lower()
-                  and nl  in r.get("trackName", "").lower()
-                  and al  in r.get("artistName", "").lower()), None)
-    if exact:
-        return exact
-    return next((r for r in results
-                 if nl in r.get("trackName", "").lower()
-                 and al in r.get("artistName", "").lower()), None)
+    if len(results) == 1:
+        return results[0]
+    # Multiple results: find matching album AND track name
+    nl  = name.lower()
+    cll = album.lower()
+    return next(
+        (r for r in results
+         if r.get("collectionName", "").lower().find(cll) != -1
+         and r.get("trackName", "").lower().find(nl) != -1),
+        None,
+    )
 
-def fetch_extras(pid, name, artist, album):
-    cached = _cache_get(pid)
+def fetch_extras(pid: str, name: str, artist: str, album: str) -> dict:
+    cached = _extras_get(pid)
     if cached is not None:
         return cached
+
     results = _itunes_search(name, artist, album)
-    r = _find_result(results, name, artist, album)
-    if not r and "(" in album:
-        clean = album[:album.rfind("(")].strip()
+    r = _find_result(results, name, album)
+
+    # Retry without parenthetical suffix, e.g. "Album (Deluxe Edition)"
+    if not r and re.search(r"\(.*\)$", album):
+        clean = re.sub(r"\s*\(.*\)$", "", album).strip()
         results = _itunes_search(name, artist, clean)
-        r = _find_result(results, name, artist, clean)
-    extras = {}
+        r = _find_result(results, name, clean)
+
+    extras: dict = {}
     if r:
         extras["artworkUrl"]        = r.get("artworkUrl100", "").replace("100x100bb", "600x600bb")
         extras["artistViewUrl"]     = r.get("artistViewUrl")
         extras["collectionViewUrl"] = r.get("collectionViewUrl")
         extras["trackViewUrl"]      = r.get("trackViewUrl")
-    _cache_set(pid, extras)
+
+    _extras_set(pid, extras)
     return extras
 
 # ── Lyrics (lrclib.net) ────────────────────────────────────────────────────────
-def fetch_lyrics(pid, name, artist, album):
+def fetch_lyrics(pid: str, name: str, artist: str, album: str) -> dict:
     cached = _lyrics_get(pid)
     if cached is not None:
         return cached
@@ -163,19 +188,19 @@ def fetch_lyrics(pid, name, artist, album):
     _lyrics_set(pid, result)
     return result
 
-def parse_lrc(lrc_text):
+def parse_lrc(lrc_text: str) -> list:
     lines = []
     for line in lrc_text.split("\n"):
         m = re.match(r"\[(\d+):(\d+(?:\.\d+)?)\](.*)", line)
         if m:
             mins, secs, text = m.groups()
-            t = int(mins) * 60 + float(secs)
+            t    = int(mins) * 60 + float(secs)
             text = text.strip()
             if text and not text.startswith("["):
                 lines.append((t, text))
     return sorted(lines, key=lambda x: x[0])
 
-def get_current_lyric(parsed_lrc, elapsed):
+def get_current_lyric(parsed_lrc: list, elapsed: float):
     current = None
     for t, text in parsed_lrc:
         if t <= elapsed:
@@ -185,11 +210,11 @@ def get_current_lyric(parsed_lrc, elapsed):
     return current
 
 # ── Discord custom status ──────────────────────────────────────────────────────
-def _discord_patch(token, payload):
+def _discord_patch(token: str, payload: dict):
     if not token:
         return
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
+    req  = urllib.request.Request(
         "https://discord.com/api/v9/users/@me/settings",
         data=data,
         headers={
@@ -205,19 +230,19 @@ def _discord_patch(token, payload):
     except Exception as e:
         log.debug("Discord status error: %s", e)
 
-def set_discord_status(token, text, emoji="\U0001f3b5"):
+def set_discord_status(token: str, text: str, emoji: str = "\U0001f3b5"):
     _discord_patch(token, {"custom_status": {
         "text": text[:128], "emoji_name": emoji, "expires_at": None,
     }})
 
-def clear_discord_status(token):
+def clear_discord_status(token: str):
     _discord_patch(token, {"custom_status": None})
 
 # ── Windows Media Session ──────────────────────────────────────────────────────
-def _is_apple_music(source):
+def _is_apple_music(source: str) -> bool:
     return any(k in source.lower() for k in ["applemusic", "apple music", "itunes"])
 
-async def _get_track():
+async def _get_track() -> dict | None:
     try:
         sessions = await MediaManager.request_async()
     except Exception as e:
@@ -244,11 +269,14 @@ async def _get_track():
             props = await session.try_get_media_properties_async()
         except Exception:
             continue
+
         title  = (props.title or "").strip()
         artist = (props.artist or "").strip()
         album  = (props.album_title or "").strip()
         if not title:
             continue
+
+        # Apple Music for Windows sometimes stuffs "Artist — Album" in artist field
         if not album and " — " in artist:
             artist, album = artist.split(" — ", 1)
             artist = artist.strip()
@@ -276,53 +304,80 @@ async def _get_track():
         }
     return None
 
-# ── Presence builder ───────────────────────────────────────────────────────────
-def _make_activity(track):
-    extras = fetch_extras(track["persistent_id"], track["title"], track["artist"], track["album"])
+# ── Activity builder (mirrors original structure) ──────────────────────────────
+def _make_activity(track: dict) -> dict:
+    extras = fetch_extras(
+        track["persistent_id"],
+        track["title"],
+        track["artist"],
+        track["album"],
+    )
 
-    now = time.time()
     pos = track.get("position", 0.0)
     dur = track.get("duration", 0.0)
+    now = time.time()
 
-    activity = {
-        "type": 2,  # Listening to Apple Music
-        "details": track["title"][:128],
-        "state":   (track["artist"] or "Unknown Artist")[:128],
+    # Mirror original timestamp math (seconds)
+    start_ts = math.ceil(now - pos)
+    end_ts   = math.ceil(now - pos + dur) if dur > 0 else None
+
+    activity: dict = {
+        "type": 2,   # Listening
+        "details": _ensure_len(track["title"]),
+        "timestamps": {"start": start_ts},
     }
+    if end_ts:
+        activity["timestamps"]["end"] = end_ts
 
-    # Progress bar: use real playback position + duration
-    if dur > 0:
-        activity["timestamps"] = {
-            "start": int(now - pos),
-            "end":   int(now - pos + dur),
-        }
-    else:
-        activity["timestamps"] = {"start": int(now)}
+    if track["artist"]:
+        # status_display_type=1 → sidebar shows "Listening to [artist]"
+        # https://github.com/discord/discord-api-docs/pull/7674
+        activity["status_display_type"] = 1
+        activity["state"] = _ensure_len(track["artist"])
 
     artwork = extras.get("artworkUrl")
-    if artwork:
-        activity["assets"] = {
-            "large_image": artwork,
-            "large_text":  (track["album"] or "Apple Music")[:128],
-        }
+    if track["album"] and extras:
+        # details_url makes the song title text clickable (Apple Music link)
+        if extras.get("trackViewUrl"):
+            activity["details_url"] = extras["trackViewUrl"]
 
+        # state_url makes the artist text clickable
+        if extras.get("artistViewUrl"):
+            activity["state_url"] = extras["artistViewUrl"]
+
+        if artwork:
+            activity["assets"] = {
+                "large_image": artwork,
+                "large_text":  _ensure_len(track["album"]),
+            }
+            # large_url makes the image clickable (album in Apple Music)
+            if extras.get("collectionViewUrl"):
+                activity["assets"]["large_url"] = extras["collectionViewUrl"]
+
+    # Spotify search button only (Apple Music link goes via details_url)
     buttons = []
-    if extras.get("trackViewUrl"):
-        buttons.append({"label": "Open in Apple Music", "url": extras["trackViewUrl"]})
     sq = urllib.parse.quote(f'artist:{track["artist"]} track:{track["title"]}')
     su = f"https://open.spotify.com/search/{sq}?si"
     if len(su) <= 512:
         buttons.append({"label": "Search on Spotify", "url": su})
     if buttons:
-        activity["buttons"] = buttons[:2]
+        activity["buttons"] = buttons
 
     return activity
 
-# ── Startup (registry, no VBS needed) ─────────────────────────────────────────
+def _next_interval(track: dict | None, cfg_interval: int) -> float:
+    """Mirror original: poll again just after the track ends."""
+    if track and track.get("duration") and track.get("position") is not None:
+        remaining = track["duration"] - track["position"]
+        if remaining > 0:
+            return min(remaining + 1, cfg_interval)
+    return cfg_interval
+
+# ── Startup (registry) ─────────────────────────────────────────────────────────
 _STARTUP_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _STARTUP_NAME = "AppleMusicRPC"
 
-def set_startup(enabled):
+def set_startup(enabled: bool):
     try:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_KEY, 0, winreg.KEY_SET_VALUE)
         if enabled:
@@ -340,7 +395,7 @@ def set_startup(enabled):
     except Exception as e:
         log.debug("Startup registry error: %s", e)
 
-def get_startup():
+def get_startup() -> bool:
     try:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_KEY, 0, winreg.KEY_READ)
         winreg.QueryValueEx(key, _STARTUP_NAME)
@@ -350,10 +405,10 @@ def get_startup():
         return False
 
 # ── Tray icon ──────────────────────────────────────────────────────────────────
-def _make_tray_image():
+def _make_tray_image() -> "Image.Image":
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    w = (255, 255, 255, 255)
+    d   = ImageDraw.Draw(img)
+    w   = (255, 255, 255, 255)
     d.rectangle([26, 8,  32, 50], fill=w)
     d.rectangle([50, 4,  56, 36], fill=w)
     d.rectangle([26, 8,  56, 18], fill=w)
@@ -393,25 +448,26 @@ class SettingsWindow:
         for w in ("TNotebook", "TFrame"):
             s.configure(w, background="#1e1e2e", borderwidth=0)
         s.configure("TNotebook.Tab", background="#313244", foreground="#cdd6f4", padding=[14, 6])
-        s.map("TNotebook.Tab", background=[("selected", "#89b4fa")],
+        s.map("TNotebook.Tab",
+              background=[("selected", "#89b4fa")],
               foreground=[("selected", "#1e1e2e")])
         s.configure("TLabel", background="#1e1e2e", foreground="#cdd6f4", font=("Segoe UI", 10))
 
         nb = ttk.Notebook(win)
         nb.pack(fill="both", expand=True, padx=12, pady=12)
 
-        t_discord = ttk.Frame(nb); nb.add(t_discord, text="  Discord  ")
-        t_general = ttk.Frame(nb); nb.add(t_general, text="  Geral  ")
-        t_about   = ttk.Frame(nb); nb.add(t_about,   text="  Sobre  ")
+        td = ttk.Frame(nb); nb.add(td, text="  Discord  ")
+        tg = ttk.Frame(nb); nb.add(tg, text="  Geral  ")
+        ta = ttk.Frame(nb); nb.add(ta, text="  Sobre  ")
 
-        self._build_discord(t_discord)
-        self._build_general(t_general)
-        self._build_about(t_about)
+        self._build_discord(td)
+        self._build_general(tg)
+        self._build_about(ta)
 
         bf = tk.Frame(win, bg="#1e1e2e")
         bf.pack(fill="x", padx=12, pady=(0, 12))
         self._btn("#89b4fa", "#1e1e2e", "Salvar",   self._save).pack(side="right", padx=(4, 0))
-        self._btn("#313244", "#cdd6f4", "Cancelar", self.win.destroy).pack(side="right")
+        self._btn("#313244", "#cdd6f4", "Cancelar", win.destroy).pack(side="right")
 
     def _btn(self, bg, fg, text, cmd):
         return tk.Button(self.win, text=text, bg=bg, fg=fg,
@@ -425,23 +481,27 @@ class SettingsWindow:
     def _build_discord(self, f):
         f.columnconfigure(1, weight=1)
 
+        # Token
         self._row(f, "Token do Discord:", 0)
         tf = tk.Frame(f, bg="#1e1e2e")
         tf.grid(row=0, column=1, sticky="ew", padx=(0, 16), pady=8)
-        self._tok_var = tk.StringVar(value=self.cfg.get("discord_token", ""))
+        self._tok_var   = tk.StringVar(value=self.cfg.get("discord_token", ""))
         self._tok_entry = tk.Entry(tf, textvariable=self._tok_var, show="•",
                                    bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4",
                                    relief="flat", bd=6, font=("Segoe UI", 9))
         self._tok_entry.pack(side="left", fill="x", expand=True)
         tk.Button(tf, text="\U0001f441", bg="#45475a", fg="#cdd6f4", relief="flat",
-                  padx=6, cursor="hand2", command=self._toggle_token).pack(side="left", padx=(4, 0))
+                  padx=6, cursor="hand2",
+                  command=self._toggle_token).pack(side="left", padx=(4, 0))
 
+        # Lyrics
         self._row(f, "Letra no status:", 1)
         self._lyr_var = tk.BooleanVar(value=self.cfg.get("lyrics_in_status", True))
         tk.Checkbutton(f, variable=self._lyr_var, bg="#1e1e2e",
                        activebackground="#1e1e2e", selectcolor="#313244",
                        fg="#cdd6f4").grid(row=1, column=1, sticky="w", padx=(0, 16), pady=8)
 
+        # Emoji
         self._row(f, "Emoji:", 2)
         self._emoji_var = tk.StringVar(value=self.cfg.get("lyrics_emoji", "\U0001f3b5"))
         tk.Entry(f, textvariable=self._emoji_var, width=5,
@@ -449,19 +509,25 @@ class SettingsWindow:
                  relief="flat", bd=6, font=("Segoe UI", 13)).grid(
                      row=2, column=1, sticky="w", padx=(0, 16), pady=8)
 
-        tk.Label(f,
-                 text='Como obter o token: Discord (web) → F12 → Console\ncole: (webpackChunkdiscord_app.push([[Math.random()],{},'
-                      '({require:e})=>{Object.values(e.c).forEach(x=>{if(x?.exports?.default?.getToken)console.log(x.exports.default.getToken())})}]),0)',
-                 bg="#1e1e2e", fg="#585b70", font=("Courier New", 7),
-                 wraplength=300, justify="left").grid(row=3, column=0, columnspan=2,
-                                                      sticky="w", padx=16, pady=(0, 4))
+        # Token hint
+        hint = (
+            "Como obter o token: Discord (web) → F12 → Console\n"
+            "(webpackChunkdiscord_app.push([[Math.random()],{},"
+            "({require:e})=>{Object.values(e.c).forEach(x=>{if"
+            "(x?.exports?.default?.getToken)console.log(x.exports"
+            ".default.getToken())})}]),0)"
+        )
+        tk.Label(f, text=hint, bg="#1e1e2e", fg="#585b70",
+                 font=("Courier New", 7), wraplength=310,
+                 justify="left").grid(row=3, column=0, columnspan=2,
+                                      sticky="w", padx=16, pady=(0, 4))
 
     def _build_general(self, f):
         f.columnconfigure(1, weight=1)
 
         self._row(f, "Intervalo de poll (seg):", 0)
-        self._poll_var = tk.IntVar(value=self.cfg.get("poll_interval", 5))
-        tk.Spinbox(f, from_=2, to=60, textvariable=self._poll_var, width=6,
+        self._poll_var = tk.IntVar(value=self.cfg.get("poll_interval", DEFAULT_TIMEOUT))
+        tk.Spinbox(f, from_=5, to=60, textvariable=self._poll_var, width=6,
                    bg="#313244", fg="#cdd6f4", buttonbackground="#45475a",
                    relief="flat", font=("Segoe UI", 10)).grid(
                        row=0, column=1, sticky="w", padx=(0, 16), pady=8)
@@ -507,6 +573,7 @@ class RPCWorker:
         self._last_lyric = None
         self._parsed_lrc = None
         self._lrc_pid    = None
+        self._start_time = time.time()
         self._stop       = threading.Event()
 
     def stop(self):
@@ -514,12 +581,18 @@ class RPCWorker:
 
     def run(self):
         while not self._stop.is_set():
+            # Mirror original 24h max runtime
+            if time.time() - self._start_time >= MAX_RUNTIME:
+                log.info("Max runtime reached, restarting...")
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+
             cfg      = self.cfg_getter()
-            interval = cfg.get("poll_interval", 5)
+            interval = cfg.get("poll_interval", DEFAULT_TIMEOUT)
             token    = cfg.get("discord_token", "")
             use_lyr  = cfg.get("lyrics_in_status", True)
             emoji    = cfg.get("lyrics_emoji", "\U0001f3b5")
 
+            # Connect RPC
             if self._rpc is None:
                 try:
                     self._rpc = Presence(CLIENT_ID)
@@ -535,11 +608,14 @@ class RPCWorker:
                     self._stop.wait(interval)
                     continue
 
+            # Get current track
             try:
                 track = asyncio.run(_get_track())
             except Exception as e:
                 log.debug("Track fetch error: %s", e)
                 track = None
+
+            next_poll = _next_interval(track, interval)
 
             try:
                 if not track or not track["playing"]:
@@ -556,21 +632,19 @@ class RPCWorker:
                 else:
                     pid = track["persistent_id"]
 
+                    # Update presence (always refresh for accurate timestamps)
+                    self._rpc.update(activity=_make_activity(track))
                     if pid != self._last_id:
-                        # Pass full activity dict — type 2 = "Listening to"
-                        self._rpc.update(activity=_make_activity(track))
                         log.info("Playing: %s — %s", track["title"], track["artist"])
                         self._last_id    = pid
                         self._parsed_lrc = None
                         self._lrc_pid    = None
                         self._last_lyric = None
-                    else:
-                        # Refresh timestamps every poll so progress stays accurate
-                        self._rpc.update(activity=_make_activity(track))
 
+                    # Lyrics in Discord custom status
                     if token and use_lyr:
                         if self._lrc_pid != pid:
-                            ly = fetch_lyrics(pid, track["title"], track["artist"], track["album"])
+                            ly     = fetch_lyrics(pid, track["title"], track["artist"], track["album"])
                             synced = ly.get("synced")
                             self._parsed_lrc = parse_lrc(synced) if synced else []
                             self._lrc_pid    = pid
@@ -588,8 +662,9 @@ class RPCWorker:
             except Exception as e:
                 log.error("Presence update error: %s", e)
 
-            self._stop.wait(interval)
+            self._stop.wait(next_poll)
 
+        # Cleanup
         cfg   = self.cfg_getter()
         token = cfg.get("discord_token", "")
         if token:
