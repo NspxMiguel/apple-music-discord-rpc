@@ -516,6 +516,12 @@ def _next_interval(track: dict | None, cfg_interval: int) -> float:
             return min(remaining + 1, cfg_interval)
     return cfg_interval
 
+def _time_until_next_lyric(parsed_lrc: list, elapsed: float) -> float:
+    for t, _ in parsed_lrc:
+        if t > elapsed:
+            return max(0.05, (t - elapsed) - 0.15)
+    return 30.0
+
 # -- Startup -------------------------------------------------------------------
 _STARTUP_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _STARTUP_NAME = "AppleMusicRPC"
@@ -995,20 +1001,25 @@ class RPCWorker:
             if token and use_lyr and self._parsed_lrc and self._last_id:
                 deadline = time.time() + next_poll
                 while not self._stop.is_set() and time.time() < deadline:
-                    tick = min(2.0, deadline - time.time())
-                    if tick <= 0:
-                        break
-                    self._stop.wait(tick)
                     try:
                         t = self._loop.run_until_complete(_get_track())
                     except Exception:
+                        self._stop.wait(min(2.0, deadline - time.time()))
                         continue
-                    if t and t["playing"] and t["persistent_id"] == self._last_id:
-                        lyric = get_current_lyric(self._parsed_lrc, t.get("position", 0))
-                        if lyric and lyric != self._last_lyric:
-                            set_discord_status(token, lyric, emoji)
-                            log.info("Lyric: %s", lyric[:60])
-                            self._last_lyric = lyric
+                    if not (t and t["playing"] and t["persistent_id"] == self._last_id):
+                        self._stop.wait(min(2.0, deadline - time.time()))
+                        continue
+                    pos = t.get("position", 0.0)
+                    lyric = get_current_lyric(self._parsed_lrc, pos)
+                    if lyric and lyric != self._last_lyric:
+                        set_discord_status(token, lyric, emoji)
+                        log.info("Lyric: %s", lyric[:60])
+                        self._last_lyric = lyric
+                    wait = min(_time_until_next_lyric(self._parsed_lrc, pos),
+                               deadline - time.time())
+                    if wait <= 0:
+                        break
+                    self._stop.wait(wait)
             else:
                 self._stop.wait(next_poll)
 
