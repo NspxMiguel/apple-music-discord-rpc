@@ -381,7 +381,7 @@ def _rpc_set_activity(rpc, activity: dict):
         "args": {"pid": os.getpid(), "activity": activity},
         "nonce": f"{time.time():.20f}",
     }
-    rpc.send(payload, "RESPONSE")
+    rpc.send_data(1, payload)
 
 def _next_interval(track: dict | None, cfg_interval: int) -> float:
     if track and track.get("duration") and track.get("position") is not None:
