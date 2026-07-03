@@ -18,6 +18,7 @@ import re
 import threading
 import queue
 import winreg
+import ctypes
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -41,25 +42,47 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-CLIENT_ID        = "773825528921849856"
-VERSION          = "1.3"
-DEFAULT_TIMEOUT  = 15          # seconds — mirror original defaultTimeout
-MAX_RUNTIME      = 24 * 3600  # 24 hours, then restart to clear memory
-BASE_DIR         = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE      = os.path.join(BASE_DIR, "config.json")
-CACHE_FILE       = os.path.join(BASE_DIR, "cache.sqlite3")
+CLIENT_ID       = "773825528921849856"
+VERSION         = "1.4"
+DEFAULT_TIMEOUT = 15
+MAX_RUNTIME     = 24 * 3600
+BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE     = os.path.join(BASE_DIR, "config.json")
+CACHE_FILE      = os.path.join(BASE_DIR, "cache.sqlite3")
+
+TOKEN_SCRIPT = (
+    "(webpackChunkdiscord_app.push([[Math.random()],{},"
+    "(e)=>{e&&e.c&&Object.values(e.c).forEach(x=>{if"
+    "(x?.exports?.default?.getToken)"
+    "console.log(x.exports.default.getToken())})}]),0)"
+)
+
+ITUNES_COUNTRIES = [
+    ("US", "United States"),
+    ("JP", "Japan"),
+    ("GB", "United Kingdom"),
+    ("AU", "Australia"),
+    ("CA", "Canada"),
+    ("BR", "Brazil"),
+    ("DE", "Germany"),
+    ("FR", "France"),
+    ("KR", "South Korea"),
+    ("MX", "Mexico"),
+    ("IN", "India"),
+]
 
 DEFAULT_CONFIG = {
     "discord_token": "",
+    "rpc_enabled": True,
     "lyrics_in_status": True,
     "lyrics_emoji": "\U0001f3b5",
     "poll_interval": DEFAULT_TIMEOUT,
     "start_with_windows": True,
+    "itunes_country": "US",
 }
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def _ensure_len(value: str, min_len: int = 2, max_len: int = 128) -> str:
-    """Mirror original ensureValidStringLength."""
     if len(value) < min_len:
         return value.ljust(min_len)
     if len(value) > max_len:
@@ -80,7 +103,7 @@ def save_config(cfg):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
-# ── SQLite cache (mirrors Deno KV) ─────────────────────────────────────────────
+# ── SQLite cache ───────────────────────────────────────────────────────────────
 def _init_db():
     con = sqlite3.connect(CACHE_FILE)
     con.execute("CREATE TABLE IF NOT EXISTS extras (id TEXT PRIMARY KEY, data TEXT, expires_at INTEGER)")
@@ -90,8 +113,8 @@ def _init_db():
 
 _db = _init_db()
 
-def _extras_get(pid: str):
-    row = _db.execute("SELECT data, expires_at FROM extras WHERE id=?", (pid,)).fetchone()
+def _extras_get(key: str):
+    row = _db.execute("SELECT data, expires_at FROM extras WHERE id=?", (key,)).fetchone()
     if not row:
         return None
     data, expires_at = row
@@ -99,9 +122,9 @@ def _extras_get(pid: str):
         return None
     return json.loads(data)
 
-def _extras_set(pid: str, extras: dict):
+def _extras_set(key: str, extras: dict):
     _db.execute("INSERT OR REPLACE INTO extras(id,data,expires_at) VALUES(?,?,?)",
-                (pid, json.dumps(extras), extras.get("expiresAt")))
+                (key, json.dumps(extras), extras.get("expiresAt")))
     _db.commit()
 
 def _lyrics_get(pid: str):
@@ -113,13 +136,11 @@ def _lyrics_set(pid: str, data: dict):
                 (pid, json.dumps(data)))
     _db.commit()
 
-# ── iTunes Search (mirrors original — JP store for coverage) ───────────────────
-def _itunes_search(name: str, artist: str, album: str) -> list:
+# ── iTunes Search ──────────────────────────────────────────────────────────────
+def _itunes_search(name: str, artist: str, album: str, country: str = "US") -> list:
     params = urllib.parse.urlencode({
-        "media": "music",
-        "entity": "song",
-        "term": f"{name} {artist} {album}",
-        "country": "JP",   # original uses JP for wider coverage
+        "media": "music", "entity": "song",
+        "term": f"{name} {artist} {album}", "country": country,
     })
     for attempt in range(3):
         try:
@@ -133,46 +154,40 @@ def _itunes_search(name: str, artist: str, album: str) -> list:
     return []
 
 def _find_result(results: list, name: str, album: str):
-    """Mirror original findMatchingResult."""
     if not results:
         return None
     if len(results) == 1:
         return results[0]
-    # Multiple results: find matching album AND track name
     nl  = name.lower()
     cll = album.lower()
     return next(
         (r for r in results
-         if r.get("collectionName", "").lower().find(cll) != -1
-         and r.get("trackName", "").lower().find(nl) != -1),
+         if cll in r.get("collectionName", "").lower()
+         and nl  in r.get("trackName", "").lower()),
         None,
     )
 
-def fetch_extras(pid: str, name: str, artist: str, album: str) -> dict:
-    cached = _extras_get(pid)
+def fetch_extras(pid: str, name: str, artist: str, album: str, country: str = "US") -> dict:
+    cache_key = f"{pid}|{country}"
+    cached = _extras_get(cache_key)
     if cached is not None:
         return cached
-
-    results = _itunes_search(name, artist, album)
+    results = _itunes_search(name, artist, album, country)
     r = _find_result(results, name, album)
-
-    # Retry without parenthetical suffix, e.g. "Album (Deluxe Edition)"
     if not r and re.search(r"\(.*\)$", album):
         clean = re.sub(r"\s*\(.*\)$", "", album).strip()
-        results = _itunes_search(name, artist, clean)
+        results = _itunes_search(name, artist, clean, country)
         r = _find_result(results, name, clean)
-
     extras: dict = {}
     if r:
         extras["artworkUrl"]        = r.get("artworkUrl100", "").replace("100x100bb", "600x600bb")
         extras["artistViewUrl"]     = r.get("artistViewUrl")
         extras["collectionViewUrl"] = r.get("collectionViewUrl")
         extras["trackViewUrl"]      = r.get("trackViewUrl")
-
-    _extras_set(pid, extras)
+    _extras_set(cache_key, extras)
     return extras
 
-# ── Lyrics (lrclib.net) ────────────────────────────────────────────────────────
+# ── Lyrics ─────────────────────────────────────────────────────────────────────
 def fetch_lyrics(pid: str, name: str, artist: str, album: str) -> dict:
     cached = _lyrics_get(pid)
     if cached is not None:
@@ -275,8 +290,6 @@ async def _get_track() -> dict | None:
         album  = (props.album_title or "").strip()
         if not title:
             continue
-
-        # Apple Music for Windows sometimes stuffs "Artist — Album" in artist field
         if not album and " — " in artist:
             artist, album = artist.split(" — ", 1)
             artist = artist.strip()
@@ -304,25 +317,25 @@ async def _get_track() -> dict | None:
         }
     return None
 
-# ── Activity builder (mirrors original structure) ──────────────────────────────
-def _make_activity(track: dict) -> dict:
+# ── Activity builder ───────────────────────────────────────────────────────────
+def _make_activity(track: dict, country: str = "US") -> dict:
     extras = fetch_extras(
         track["persistent_id"],
         track["title"],
         track["artist"],
         track["album"],
+        country,
     )
 
     pos = track.get("position", 0.0)
     dur = track.get("duration", 0.0)
     now = time.time()
 
-    # Mirror original timestamp math (seconds)
     start_ts = math.ceil(now - pos)
     end_ts   = math.ceil(now - pos + dur) if dur > 0 else None
 
     activity: dict = {
-        "type": 2,   # Listening
+        "type": 2,
         "details": _ensure_len(track["title"]),
         "timestamps": {"start": start_ts},
     }
@@ -330,50 +343,54 @@ def _make_activity(track: dict) -> dict:
         activity["timestamps"]["end"] = end_ts
 
     if track["artist"]:
-        # status_display_type=1 → sidebar shows "Listening to [artist]"
-        # https://github.com/discord/discord-api-docs/pull/7674
         activity["status_display_type"] = 1
         activity["state"] = _ensure_len(track["artist"])
 
     artwork = extras.get("artworkUrl")
     if track["album"] and extras:
-        # details_url makes the song title text clickable (Apple Music link)
         if extras.get("trackViewUrl"):
             activity["details_url"] = extras["trackViewUrl"]
-
-        # state_url makes the artist text clickable
         if extras.get("artistViewUrl"):
             activity["state_url"] = extras["artistViewUrl"]
-
         if artwork:
             activity["assets"] = {
                 "large_image": artwork,
                 "large_text":  _ensure_len(track["album"]),
             }
-            # large_url makes the image clickable (album in Apple Music)
             if extras.get("collectionViewUrl"):
                 activity["assets"]["large_url"] = extras["collectionViewUrl"]
 
-    # Spotify search button only (Apple Music link goes via details_url)
     buttons = []
+    yq = urllib.parse.quote(f"{track['artist']} {track['title']}")
+    yu = f"https://www.youtube.com/results?search_query={yq}"
+    if len(yu) <= 512:
+        buttons.append({"label": "Search on YouTube", "url": yu})
     sq = urllib.parse.quote(f'artist:{track["artist"]} track:{track["title"]}')
     su = f"https://open.spotify.com/search/{sq}?si"
     if len(su) <= 512:
         buttons.append({"label": "Search on Spotify", "url": su})
     if buttons:
-        activity["buttons"] = buttons
+        activity["buttons"] = buttons[:2]
 
     return activity
 
+# Send activity directly via IPC pipe (version-agnostic, supports undocumented fields)
+def _rpc_set_activity(rpc, activity: dict):
+    payload = {
+        "cmd": "SET_ACTIVITY",
+        "args": {"pid": os.getpid(), "activity": activity},
+        "nonce": f"{time.time():.20f}",
+    }
+    rpc.send(payload, "RESPONSE")
+
 def _next_interval(track: dict | None, cfg_interval: int) -> float:
-    """Mirror original: poll again just after the track ends."""
     if track and track.get("duration") and track.get("position") is not None:
         remaining = track["duration"] - track["position"]
         if remaining > 0:
             return min(remaining + 1, cfg_interval)
     return cfg_interval
 
-# ── Startup (registry) ─────────────────────────────────────────────────────────
+# ── Startup ────────────────────────────────────────────────────────────────────
 _STARTUP_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _STARTUP_NAME = "AppleMusicRPC"
 
@@ -416,6 +433,116 @@ def _make_tray_image() -> "Image.Image":
     d.ellipse(  [34, 32, 60, 46], fill=w)
     return img
 
+# ── Token guide window ─────────────────────────────────────────────────────────
+class TokenGuideWindow:
+    _instance = None
+
+    @classmethod
+    def open(cls, root):
+        if cls._instance and cls._instance.win.winfo_exists():
+            cls._instance.win.lift()
+            cls._instance.win.focus_force()
+            return
+        cls._instance = cls(root)
+
+    def __init__(self, root):
+        win = tk.Toplevel(root)
+        win.title("How to get your Discord token")
+        win.geometry("520x560")
+        win.resizable(False, False)
+        win.configure(bg="#1e1e2e")
+        win.lift()
+        win.focus_force()
+        self.win = win
+        self._build(win)
+
+    def _build(self, win):
+        tk.Label(win, text="How to get your Discord token",
+                 bg="#1e1e2e", fg="#89b4fa",
+                 font=("Segoe UI", 13, "bold")).pack(pady=(14, 2))
+        tk.Label(win,
+                 text="Required only for lyrics in Discord status. Never share your token.",
+                 bg="#1e1e2e", fg="#a6adc8", font=("Segoe UI", 9),
+                 justify="center").pack(pady=(0, 10))
+
+        # ── Method 1: Network tab (always works) ──────────────────────────────
+        m1 = tk.Frame(win, bg="#1e1e2e")
+        m1.pack(fill="x", padx=20, pady=(0, 6))
+        tk.Label(m1, text="Method 1 — Network tab  (recommended, always works)",
+                 bg="#1e1e2e", fg="#a6e3a1",
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w")
+
+        net_steps = [
+            ("1", "Open discord.com/channels/@me in any browser"),
+            ("2", "Press F12  →  click the Network tab"),
+            ("3", "Press Ctrl+R to reload the page"),
+            ("4", 'In the filter box type  /api/v9  and press Enter'),
+            ("5", "Click any request  →  Headers  →  Request Headers"),
+            ("6", 'Find  "authorization:"  — that value is your token'),
+        ]
+        for num, desc in net_steps:
+            row = tk.Frame(m1, bg="#1e1e2e")
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=num, bg="#45475a", fg="#cdd6f4",
+                     font=("Segoe UI", 9, "bold"), width=2,
+                     padx=4, pady=2).pack(side="left", padx=(0, 8))
+            tk.Label(row, text=desc, bg="#1e1e2e", fg="#cdd6f4",
+                     font=("Segoe UI", 9), anchor="w").pack(side="left", fill="x")
+
+        # ── Method 2: Console script (Chrome/Edge only) ───────────────────────
+        tk.Frame(win, bg="#313244", height=1).pack(fill="x", padx=20, pady=10)
+
+        m2 = tk.Frame(win, bg="#1e1e2e")
+        m2.pack(fill="x", padx=20, pady=(0, 6))
+        tk.Label(m2, text="Method 2 — Console script  (Chrome / Edge only)",
+                 bg="#1e1e2e", fg="#89b4fa",
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w")
+
+        con_steps = [
+            ("1", "Open discord.com/channels/@me in Chrome or Edge"),
+            ("2", 'Press F12  →  Console tab'),
+            ("3", 'Type  allow pasting  and press Enter  (security prompt)'),
+            ("4", "Paste the script below and press Enter"),
+        ]
+        for num, desc in con_steps:
+            row = tk.Frame(m2, bg="#1e1e2e")
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=num, bg="#45475a", fg="#cdd6f4",
+                     font=("Segoe UI", 9, "bold"), width=2,
+                     padx=4, pady=2).pack(side="left", padx=(0, 8))
+            tk.Label(row, text=desc, bg="#1e1e2e", fg="#cdd6f4",
+                     font=("Segoe UI", 9), anchor="w").pack(side="left", fill="x")
+
+        script_frame = tk.Frame(win, bg="#313244", bd=0)
+        script_frame.pack(fill="x", padx=20, pady=(8, 2))
+        script_text = tk.Text(script_frame, height=3, wrap="word",
+                              bg="#313244", fg="#a6e3a1",
+                              font=("Courier New", 8), relief="flat",
+                              bd=8, state="normal", cursor="arrow")
+        script_text.insert("1.0", TOKEN_SCRIPT)
+        script_text.config(state="disabled")
+        script_text.pack(fill="x")
+
+        def copy_script():
+            win.clipboard_clear()
+            win.clipboard_append(TOKEN_SCRIPT)
+            copy_btn.config(text="Copied! ", bg="#a6e3a1", fg="#1e1e2e")
+            win.after(2000, lambda: copy_btn.config(
+                text="Copy script", bg="#45475a", fg="#cdd6f4"))
+
+        copy_btn = tk.Button(win, text="Copy script",
+                             bg="#45475a", fg="#cdd6f4",
+                             font=("Segoe UI", 9), relief="flat",
+                             padx=12, pady=4, cursor="hand2",
+                             command=copy_script)
+        copy_btn.pack(pady=(2, 10))
+
+        tk.Button(win, text="Close",
+                  bg="#313244", fg="#cdd6f4",
+                  font=("Segoe UI", 10), relief="flat",
+                  padx=20, pady=5, cursor="hand2",
+                  command=win.destroy).pack()
+
 # ── Settings window ────────────────────────────────────────────────────────────
 class SettingsWindow:
     _instance = None
@@ -429,11 +556,12 @@ class SettingsWindow:
         cls._instance = cls(root, cfg, on_save)
 
     def __init__(self, root, cfg, on_save):
+        self.root    = root
         self.cfg     = cfg.copy()
         self.on_save = on_save
         win = tk.Toplevel(root)
-        win.title("Apple Music RPC — Configurações")
-        win.geometry("480x400")
+        win.title("Apple Music RPC — Settings")
+        win.geometry("500x430")
         win.resizable(False, False)
         win.configure(bg="#1e1e2e")
         win.protocol("WM_DELETE_WINDOW", win.destroy)
@@ -451,14 +579,16 @@ class SettingsWindow:
         s.map("TNotebook.Tab",
               background=[("selected", "#89b4fa")],
               foreground=[("selected", "#1e1e2e")])
-        s.configure("TLabel", background="#1e1e2e", foreground="#cdd6f4", font=("Segoe UI", 10))
+        s.configure("TCombobox", fieldbackground="#313244", background="#313244",
+                    foreground="#cdd6f4", selectbackground="#45475a",
+                    arrowcolor="#cdd6f4")
 
         nb = ttk.Notebook(win)
         nb.pack(fill="both", expand=True, padx=12, pady=12)
 
         td = ttk.Frame(nb); nb.add(td, text="  Discord  ")
-        tg = ttk.Frame(nb); nb.add(tg, text="  Geral  ")
-        ta = ttk.Frame(nb); nb.add(ta, text="  Sobre  ")
+        tg = ttk.Frame(nb); nb.add(tg, text="  General  ")
+        ta = ttk.Frame(nb); nb.add(ta, text="  About  ")
 
         self._build_discord(td)
         self._build_general(tg)
@@ -466,77 +596,104 @@ class SettingsWindow:
 
         bf = tk.Frame(win, bg="#1e1e2e")
         bf.pack(fill="x", padx=12, pady=(0, 12))
-        self._btn("#89b4fa", "#1e1e2e", "Salvar",   self._save).pack(side="right", padx=(4, 0))
-        self._btn("#313244", "#cdd6f4", "Cancelar", win.destroy).pack(side="right")
+        self._btn("#89b4fa", "#1e1e2e", "Save",   self._save).pack(side="right", padx=(4, 0))
+        self._btn("#313244", "#cdd6f4", "Cancel", win.destroy).pack(side="right")
 
     def _btn(self, bg, fg, text, cmd):
         return tk.Button(self.win, text=text, bg=bg, fg=fg,
                          font=("Segoe UI", 10, "bold"), relief="flat",
                          padx=18, pady=5, cursor="hand2", command=cmd)
 
-    def _row(self, parent, text, row):
+    def _row(self, parent, text, row, col=0):
         tk.Label(parent, text=text, bg="#1e1e2e", fg="#cdd6f4",
-                 font=("Segoe UI", 10)).grid(row=row, column=0, sticky="w", padx=16, pady=8)
+                 font=("Segoe UI", 10)).grid(row=row, column=col,
+                                             sticky="w", padx=16, pady=7)
+
+    def _check(self, parent, var, row):
+        tk.Checkbutton(parent, variable=var, bg="#1e1e2e",
+                       activebackground="#1e1e2e", selectcolor="#313244",
+                       fg="#cdd6f4").grid(row=row, column=1,
+                                          sticky="w", padx=(0, 16), pady=7)
 
     def _build_discord(self, f):
         f.columnconfigure(1, weight=1)
 
-        # Token
-        self._row(f, "Token do Discord:", 0)
+        self._row(f, "Token:", 0)
         tf = tk.Frame(f, bg="#1e1e2e")
-        tf.grid(row=0, column=1, sticky="ew", padx=(0, 16), pady=8)
+        tf.grid(row=0, column=1, sticky="ew", padx=(0, 16), pady=7)
+
         self._tok_var   = tk.StringVar(value=self.cfg.get("discord_token", ""))
         self._tok_entry = tk.Entry(tf, textvariable=self._tok_var, show="•",
-                                   bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4",
+                                   bg="#313244", fg="#cdd6f4",
+                                   insertbackground="#cdd6f4",
                                    relief="flat", bd=6, font=("Segoe UI", 9))
         self._tok_entry.pack(side="left", fill="x", expand=True)
-        tk.Button(tf, text="\U0001f441", bg="#45475a", fg="#cdd6f4", relief="flat",
-                  padx=6, cursor="hand2",
-                  command=self._toggle_token).pack(side="left", padx=(4, 0))
 
-        # Lyrics
-        self._row(f, "Letra no status:", 1)
+        self._eye_btn = tk.Button(tf, text="Show", bg="#45475a", fg="#cdd6f4",
+                                  relief="flat", padx=6, cursor="hand2",
+                                  font=("Segoe UI", 8),
+                                  command=self._toggle_token)
+        self._eye_btn.pack(side="left", padx=(4, 0))
+
+        tk.Button(f, text="How to get your token →",
+                  bg="#1e1e2e", fg="#89b4fa",
+                  font=("Segoe UI", 9, "underline"), relief="flat",
+                  cursor="hand2", anchor="w",
+                  command=lambda: TokenGuideWindow.open(self.root)
+                  ).grid(row=1, column=0, columnspan=2, sticky="w",
+                         padx=12, pady=(0, 4))
+
+        self._row(f, "Enable Rich Presence:", 2)
+        self._rpc_var = tk.BooleanVar(value=self.cfg.get("rpc_enabled", True))
+        self._check(f, self._rpc_var, 2)
+
+        self._row(f, "Lyrics in status:", 3)
         self._lyr_var = tk.BooleanVar(value=self.cfg.get("lyrics_in_status", True))
-        tk.Checkbutton(f, variable=self._lyr_var, bg="#1e1e2e",
-                       activebackground="#1e1e2e", selectcolor="#313244",
-                       fg="#cdd6f4").grid(row=1, column=1, sticky="w", padx=(0, 16), pady=8)
+        self._check(f, self._lyr_var, 3)
 
-        # Emoji
-        self._row(f, "Emoji:", 2)
+        self._row(f, "Lyrics emoji:", 4)
         self._emoji_var = tk.StringVar(value=self.cfg.get("lyrics_emoji", "\U0001f3b5"))
         tk.Entry(f, textvariable=self._emoji_var, width=5,
                  bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4",
                  relief="flat", bd=6, font=("Segoe UI", 13)).grid(
-                     row=2, column=1, sticky="w", padx=(0, 16), pady=8)
-
-        # Token hint
-        hint = (
-            "Como obter o token: Discord (web) → F12 → Console\n"
-            "(webpackChunkdiscord_app.push([[Math.random()],{},"
-            "({require:e})=>{Object.values(e.c).forEach(x=>{if"
-            "(x?.exports?.default?.getToken)console.log(x.exports"
-            ".default.getToken())})}]),0)"
-        )
-        tk.Label(f, text=hint, bg="#1e1e2e", fg="#585b70",
-                 font=("Courier New", 7), wraplength=310,
-                 justify="left").grid(row=3, column=0, columnspan=2,
-                                      sticky="w", padx=16, pady=(0, 4))
+                     row=4, column=1, sticky="w", padx=(0, 16), pady=7)
 
     def _build_general(self, f):
         f.columnconfigure(1, weight=1)
 
-        self._row(f, "Intervalo de poll (seg):", 0)
+        self._row(f, "Poll interval (sec):", 0)
         self._poll_var = tk.IntVar(value=self.cfg.get("poll_interval", DEFAULT_TIMEOUT))
         tk.Spinbox(f, from_=5, to=60, textvariable=self._poll_var, width=6,
                    bg="#313244", fg="#cdd6f4", buttonbackground="#45475a",
                    relief="flat", font=("Segoe UI", 10)).grid(
-                       row=0, column=1, sticky="w", padx=(0, 16), pady=8)
+                       row=0, column=1, sticky="w", padx=(0, 16), pady=7)
 
-        self._row(f, "Iniciar com o Windows:", 1)
+        self._row(f, "iTunes store:", 1)
+        country_codes  = [c for c, _ in ITUNES_COUNTRIES]
+        country_labels = [f"{name} ({code})" for code, name in ITUNES_COUNTRIES]
+        self._country_var = tk.StringVar()
+        cur_code = self.cfg.get("itunes_country", "US")
+        try:
+            idx = country_codes.index(cur_code)
+            self._country_var.set(country_labels[idx])
+        except ValueError:
+            self._country_var.set(country_labels[0])
+        self._country_codes  = country_codes
+        self._country_labels = country_labels
+        combo = ttk.Combobox(f, textvariable=self._country_var,
+                             values=country_labels, state="readonly",
+                             width=22, font=("Segoe UI", 9))
+        combo.grid(row=1, column=1, sticky="w", padx=(0, 16), pady=7)
+
+        self._row(f, "Start with Windows:", 2)
         self._start_var = tk.BooleanVar(value=get_startup())
-        tk.Checkbutton(f, variable=self._start_var, bg="#1e1e2e",
-                       activebackground="#1e1e2e", selectcolor="#313244",
-                       fg="#cdd6f4").grid(row=1, column=1, sticky="w", padx=(0, 16), pady=8)
+        self._check(f, self._start_var, 2)
+
+        tk.Label(f, text="The poll interval controls how often the app\nchecks which track is playing.",
+                 bg="#1e1e2e", fg="#585b70",
+                 font=("Segoe UI", 8), justify="left").grid(
+                     row=3, column=0, columnspan=2,
+                     sticky="w", padx=16, pady=(8, 0))
 
     def _build_about(self, f):
         tk.Label(f, text="\U0001f3b5", bg="#1e1e2e", fg="#89b4fa",
@@ -544,24 +701,36 @@ class SettingsWindow:
         tk.Label(f, text=f"Apple Music Discord RPC  v{VERSION}",
                  bg="#1e1e2e", fg="#cdd6f4",
                  font=("Segoe UI", 13, "bold")).pack()
-        tk.Label(f, text="Port Windows — baseado em NextFire/apple-music-discord-rpc",
+        tk.Label(f, text="Windows port — based on NextFire/apple-music-discord-rpc",
                  bg="#1e1e2e", fg="#585b70", font=("Segoe UI", 9)).pack(pady=4)
         tk.Label(f, text="github.com/spxmiguel/apple-music-discord-rpc",
                  bg="#1e1e2e", fg="#89b4fa", font=("Segoe UI", 9)).pack()
 
     def _toggle_token(self):
-        self._tok_entry.config(show="" if self._tok_entry.cget("show") == "•" else "•")
+        showing = self._tok_entry.cget("show") == ""
+        self._tok_entry.config(show="•" if showing else "")
+        self._eye_btn.config(text="Show" if showing else "Hide")
 
     def _save(self):
+        # Resolve country code from label
+        label = self._country_var.get()
+        try:
+            idx = self._country_labels.index(label)
+            country = self._country_codes[idx]
+        except ValueError:
+            country = "US"
+
         self.cfg["discord_token"]      = self._tok_var.get().strip()
+        self.cfg["rpc_enabled"]        = self._rpc_var.get()
         self.cfg["lyrics_in_status"]   = self._lyr_var.get()
         self.cfg["lyrics_emoji"]       = self._emoji_var.get()
         self.cfg["poll_interval"]      = self._poll_var.get()
         self.cfg["start_with_windows"] = self._start_var.get()
+        self.cfg["itunes_country"]     = country
         set_startup(self.cfg["start_with_windows"])
         save_config(self.cfg)
         self.on_save(self.cfg)
-        messagebox.showinfo("Salvo", "Configurações salvas!", parent=self.win)
+        messagebox.showinfo("Saved", "Settings saved!", parent=self.win)
         self.win.destroy()
 
 # ── RPC worker ─────────────────────────────────────────────────────────────────
@@ -575,13 +744,31 @@ class RPCWorker:
         self._lrc_pid    = None
         self._start_time = time.time()
         self._stop       = threading.Event()
+        self._loop       = None
 
     def stop(self):
         self._stop.set()
 
     def run(self):
+        # Initialize COM as Single-Threaded Apartment for WinRT in this thread
+        try:
+            ctypes.windll.ole32.CoInitializeEx(None, 0)
+        except Exception:
+            pass
+
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._main_loop()
+        finally:
+            self._loop.close()
+            try:
+                ctypes.windll.ole32.CoUninitialize()
+            except Exception:
+                pass
+
+    def _main_loop(self):
         while not self._stop.is_set():
-            # Mirror original 24h max runtime
             if time.time() - self._start_time >= MAX_RUNTIME:
                 log.info("Max runtime reached, restarting...")
                 os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -589,11 +776,21 @@ class RPCWorker:
             cfg      = self.cfg_getter()
             interval = cfg.get("poll_interval", DEFAULT_TIMEOUT)
             token    = cfg.get("discord_token", "")
+            rpc_on   = cfg.get("rpc_enabled", True)
             use_lyr  = cfg.get("lyrics_in_status", True)
             emoji    = cfg.get("lyrics_emoji", "\U0001f3b5")
+            country  = cfg.get("itunes_country", "US")
 
-            # Connect RPC
-            if self._rpc is None:
+            if not rpc_on and self._rpc is not None:
+                try:
+                    self._rpc.clear()
+                    self._rpc.close()
+                except Exception:
+                    pass
+                self._rpc     = None
+                self._last_id = None
+
+            if rpc_on and self._rpc is None:
                 try:
                     self._rpc = Presence(CLIENT_ID)
                     self._rpc.connect()
@@ -608,9 +805,8 @@ class RPCWorker:
                     self._stop.wait(interval)
                     continue
 
-            # Get current track
             try:
-                track = asyncio.run(_get_track())
+                track = self._loop.run_until_complete(_get_track())
             except Exception as e:
                 log.debug("Track fetch error: %s", e)
                 track = None
@@ -620,7 +816,8 @@ class RPCWorker:
             try:
                 if not track or not track["playing"]:
                     if self._last_id is not None:
-                        self._rpc.clear()
+                        if self._rpc:
+                            self._rpc.clear()
                         reason = "paused" if (track and track["paused"]) else "stopped"
                         log.info("Cleared (%s).", reason)
                         self._last_id    = None
@@ -632,16 +829,18 @@ class RPCWorker:
                 else:
                     pid = track["persistent_id"]
 
-                    # Update presence (always refresh for accurate timestamps)
-                    self._rpc.update(activity=_make_activity(track))
-                    if pid != self._last_id:
-                        log.info("Playing: %s — %s", track["title"], track["artist"])
-                        self._last_id    = pid
-                        self._parsed_lrc = None
-                        self._lrc_pid    = None
-                        self._last_lyric = None
+                    if self._rpc:
+                        _rpc_set_activity(self._rpc, _make_activity(track, country))
+                        if pid != self._last_id:
+                            log.info("Playing: %s — %s", track["title"], track["artist"])
+                            self._last_id    = pid
+                            self._parsed_lrc = None
+                            self._lrc_pid    = None
+                            self._last_lyric = None
+                    elif pid != self._last_id:
+                        log.info("Playing (RPC off): %s — %s", track["title"], track["artist"])
+                        self._last_id = pid
 
-                    # Lyrics in Discord custom status
                     if token and use_lyr:
                         if self._lrc_pid != pid:
                             ly     = fetch_lyrics(pid, track["title"], track["artist"], track["album"])
@@ -664,7 +863,6 @@ class RPCWorker:
 
             self._stop.wait(next_poll)
 
-        # Cleanup
         cfg   = self.cfg_getter()
         token = cfg.get("discord_token", "")
         if token:
@@ -721,10 +919,10 @@ def main():
     tray = None
     if HAS_TRAY:
         menu = pystray.Menu(
-            pystray.MenuItem("Configurações",
+            pystray.MenuItem("Settings",
                              lambda icon, item: gui_q.put("settings")),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Sair", lambda icon, item: gui_q.put("quit")),
+            pystray.MenuItem("Quit", lambda icon, item: gui_q.put("quit")),
         )
         tray = pystray.Icon("apple-music-rpc", _make_tray_image(), "Apple Music RPC", menu)
         threading.Thread(target=tray.run, daemon=True).start()

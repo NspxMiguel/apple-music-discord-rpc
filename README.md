@@ -44,16 +44,29 @@ On first launch the **Settings** window opens automatically. Configure your Disc
 
 > ⚠️ Never share your token. Treat it like a password.
 
-1. Open Discord in your **browser** (discord.com/app)
+**Method 1 — Network tab (recommended, works in any browser)**
+
+1. Open **discord.com/channels/@me** in any browser
+2. Press **F12** → **Network** tab
+3. Press **Ctrl+R** to reload the page
+4. In the filter bar type `/api/v9` and press Enter
+5. Click any request in the list → **Headers** → **Request Headers**
+6. Find `authorization:` — that value is your token
+
+**Method 2 — Console script (Chrome / Edge only)**
+
+1. Open **discord.com/channels/@me** in Chrome or Edge
 2. Press **F12** → **Console** tab
-3. Paste the following and press Enter:
+3. Type `allow pasting` and press Enter (Discord security prompt)
+4. Paste the script below and press Enter:
 
 ```js
-(webpackChunkdiscord_app.push([[Math.random()],{},({require:e})=>{Object.values(e.c).forEach(x=>{if(x?.exports?.default?.getToken)console.log(x.exports.default.getToken())})}]),0)
+(webpackChunkdiscord_app.push([[Math.random()],{},(e)=>{e&&e.c&&Object.values(e.c).forEach(x=>{if(x?.exports?.default?.getToken)console.log(x.exports.default.getToken())})}]),0)
 ```
 
-4. Copy the token that appears in the console output
-5. Paste it in the **Settings → Discord → Token** field
+5. Copy the token that appears in the console output
+
+Paste the token in **Settings → Discord → Token**.
 
 ### Uninstall
 
