@@ -46,6 +46,7 @@ CLIENT_ID       = "773825528921849856"
 VERSION         = "1.4"
 DEFAULT_TIMEOUT = 15
 MAX_RUNTIME     = 24 * 3600
+LYRIC_OFFSET    = 2.0   # WinRT reports buffer position ~2s ahead of audio
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE     = os.path.join(BASE_DIR, "config.json")
 CACHE_FILE      = os.path.join(BASE_DIR, "cache.sqlite3")
@@ -879,7 +880,7 @@ class RPCWorker:
             except Exception as e:
                 log.error("Presence update error: %s", e)
 
-            # Lyric precision loop: sleep exactly until the next lyric line is due
+            # Lyric precision loop: sleep until exact next lyric timestamp
             if token and use_lyr and self._parsed_lrc and self._last_id:
                 deadline = time.time() + next_poll
                 while not self._stop.is_set() and time.time() < deadline:
@@ -888,10 +889,12 @@ class RPCWorker:
                     except Exception:
                         self._stop.wait(min(2.0, deadline - time.time()))
                         continue
-                    if not (t and t["playing"] and t["persistent_id"] == self._last_id):
+                    if not t or not t["playing"]:
                         self._stop.wait(min(2.0, deadline - time.time()))
                         continue
-                    pos = t.get("position", 0.0)
+                    if t["persistent_id"] != self._last_id:
+                        break  # Song changed — exit immediately so main loop updates RPC
+                    pos = t.get("position", 0.0) - LYRIC_OFFSET
                     lyric = get_current_lyric(self._parsed_lrc, pos)
                     if lyric and lyric != self._last_lyric:
                         set_discord_status(token, lyric, emoji)
