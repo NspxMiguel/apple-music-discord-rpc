@@ -105,7 +105,7 @@ def save_config(cfg):
 
 # ── SQLite cache ───────────────────────────────────────────────────────────────
 def _init_db():
-    con = sqlite3.connect(CACHE_FILE)
+    con = sqlite3.connect(CACHE_FILE, check_same_thread=False)
     con.execute("CREATE TABLE IF NOT EXISTS extras (id TEXT PRIMARY KEY, data TEXT, expires_at INTEGER)")
     con.execute("CREATE TABLE IF NOT EXISTS lyrics  (id TEXT PRIMARY KEY, data TEXT)")
     con.commit()
