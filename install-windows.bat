@@ -167,7 +167,7 @@ log = logging.getLogger(__name__)
 CLIENT_ID       = "773825528921849856"
 VERSION         = "1.4"
 DEFAULT_TIMEOUT = 15
-LYRIC_OFFSET    = 2.0   # WinRT reports buffer position ~2s ahead of audio
+LYRIC_DISPLAY_LEAD = 2.0  # seconds to send update early to compensate Discord display latency
 MAX_RUNTIME     = 24 * 3600
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE     = os.path.join(BASE_DIR, "config.json")
@@ -520,7 +520,7 @@ def _next_interval(track: dict | None, cfg_interval: int) -> float:
 def _time_until_next_lyric(parsed_lrc: list, elapsed: float) -> float:
     for t, _ in parsed_lrc:
         if t > elapsed:
-            return max(0.05, (t - elapsed) - 0.15)
+            return max(0.0, (t - elapsed) - LYRIC_DISPLAY_LEAD)
     return 30.0
 
 # -- Startup -------------------------------------------------------------------
@@ -1013,7 +1013,7 @@ class RPCWorker:
                 if t["persistent_id"] != self._last_id:
                     break
                 if has_lyrics:
-                    pos   = t.get("position", 0.0) - LYRIC_OFFSET
+                    pos   = t.get("position", 0.0)
                     lyric = get_current_lyric(self._parsed_lrc, pos)
                     if lyric and lyric != self._last_lyric:
                         set_discord_status(token, lyric, emoji)
@@ -1022,7 +1022,7 @@ class RPCWorker:
                     wait = min(_time_until_next_lyric(self._parsed_lrc, pos),
                                deadline - time.time())
                 else:
-                    wait = min(2.0, deadline - time.time())
+                    wait = min(0.5, deadline - time.time())
                 if wait <= 0:
                     break
                 self._stop.wait(wait)
