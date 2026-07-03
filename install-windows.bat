@@ -120,7 +120,6 @@ try:
     HAS_TRAY = True
 except ImportError:
     HAS_TRAY = False
-    print("[AVISO] pystray/Pillow nao instalados -- sem icone na bandeja.")
 
 from pypresence import Presence, InvalidPipe
 from winrt.windows.media.control import (
@@ -149,6 +148,7 @@ DEFAULT_CONFIG = {
     "start_with_windows": True,
 }
 
+# ── Config ─────────────────────────────────────────────────────────────────────
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
@@ -162,10 +162,11 @@ def save_config(cfg):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
+# ── SQLite cache ───────────────────────────────────────────────────────────────
 def _init_db():
     con = sqlite3.connect(CACHE_FILE)
     con.execute("CREATE TABLE IF NOT EXISTS extras (id TEXT PRIMARY KEY, data TEXT, expires_at INTEGER)")
-    con.execute("CREATE TABLE IF NOT EXISTS lyrics (id TEXT PRIMARY KEY, data TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS lyrics  (id TEXT PRIMARY KEY, data TEXT)")
     con.commit()
     return con
 
@@ -194,9 +195,12 @@ def _lyrics_set(pid, data):
                 (pid, json.dumps(data)))
     _db.commit()
 
+# ── iTunes Search ──────────────────────────────────────────────────────────────
 def _itunes_search(name, artist, album):
-    params = urllib.parse.urlencode({"media": "music", "entity": "song",
-                                     "term": f"{name} {artist} {album}", "country": "US"})
+    params = urllib.parse.urlencode({
+        "media": "music", "entity": "song",
+        "term": f"{name} {artist} {album}", "country": "US",
+    })
     try:
         with urllib.request.urlopen(f"https://itunes.apple.com/search?{params}", timeout=8) as r:
             return json.loads(r.read()).get("results", [])
@@ -237,6 +241,7 @@ def fetch_extras(pid, name, artist, album):
     _cache_set(pid, extras)
     return extras
 
+# ── Lyrics (lrclib.net) ────────────────────────────────────────────────────────
 def fetch_lyrics(pid, name, artist, album):
     cached = _lyrics_get(pid)
     if cached is not None:
@@ -273,6 +278,7 @@ def get_current_lyric(parsed_lrc, elapsed):
             break
     return current
 
+# ── Discord custom status ──────────────────────────────────────────────────────
 def _discord_patch(token, payload):
     if not token:
         return
@@ -294,11 +300,14 @@ def _discord_patch(token, payload):
         log.debug("Discord status error: %s", e)
 
 def set_discord_status(token, text, emoji="\U0001f3b5"):
-    _discord_patch(token, {"custom_status": {"text": text[:128], "emoji_name": emoji, "expires_at": None}})
+    _discord_patch(token, {"custom_status": {
+        "text": text[:128], "emoji_name": emoji, "expires_at": None,
+    }})
 
 def clear_discord_status(token):
     _discord_patch(token, {"custom_status": None})
 
+# ── Windows Media Session ──────────────────────────────────────────────────────
 def _is_apple_music(source):
     return any(k in source.lower() for k in ["applemusic", "apple music", "itunes"])
 
@@ -308,6 +317,7 @@ async def _get_track():
     except Exception as e:
         log.debug("MediaManager: %s", e)
         return None
+
     candidates = []
     cur = sessions.get_current_session()
     if cur:
@@ -315,6 +325,7 @@ async def _get_track():
     for s in sessions.get_sessions():
         if s not in candidates:
             candidates.append(s)
+
     for session in candidates:
         source = session.source_app_user_model_id or ""
         if not _is_apple_music(source):
@@ -332,37 +343,63 @@ async def _get_track():
         album  = (props.album_title or "").strip()
         if not title:
             continue
-        if not album and " — " in artist:
-            artist, album = artist.split(" — ", 1)
+        if not album and " -- " in artist:
+            artist, album = artist.split(" -- ", 1)
             artist = artist.strip()
             album  = album.strip()
+
         position = 0.0
+        duration = 0.0
         try:
             tl = session.get_timeline_properties()
             if tl:
                 position = tl.position / 1e7
+                duration = tl.end_time / 1e7
         except Exception:
             pass
+
         return {
             "persistent_id": f"{title}|{artist}|{album}",
-            "title": title, "artist": artist, "album": album,
-            "playing": status == PlaybackStatus.PLAYING,
-            "paused":  status == PlaybackStatus.PAUSED,
+            "title":    title,
+            "artist":   artist,
+            "album":    album,
+            "playing":  status == PlaybackStatus.PLAYING,
+            "paused":   status == PlaybackStatus.PAUSED,
             "position": position,
+            "duration": duration,
         }
     return None
 
+# ── Presence builder ───────────────────────────────────────────────────────────
 def _make_activity(track):
     extras = fetch_extras(track["persistent_id"], track["title"], track["artist"], track["album"])
-    kwargs = {
+
+    now = time.time()
+    pos = track.get("position", 0.0)
+    dur = track.get("duration", 0.0)
+
+    activity = {
+        "type": 2,  # Listening to Apple Music
         "details": track["title"][:128],
         "state":   (track["artist"] or "Unknown Artist")[:128],
-        "start":   int(time.time()),
     }
+
+    # Progress bar: use real playback position + duration
+    if dur > 0:
+        activity["timestamps"] = {
+            "start": int(now - pos),
+            "end":   int(now - pos + dur),
+        }
+    else:
+        activity["timestamps"] = {"start": int(now)}
+
     artwork = extras.get("artworkUrl")
     if artwork:
-        kwargs["large_image"] = artwork
-        kwargs["large_text"]  = (track["album"] or "Apple Music")[:128]
+        activity["assets"] = {
+            "large_image": artwork,
+            "large_text":  (track["album"] or "Apple Music")[:128],
+        }
+
     buttons = []
     if extras.get("trackViewUrl"):
         buttons.append({"label": "Open in Apple Music", "url": extras["trackViewUrl"]})
@@ -371,18 +408,23 @@ def _make_activity(track):
     if len(su) <= 512:
         buttons.append({"label": "Search on Spotify", "url": su})
     if buttons:
-        kwargs["buttons"] = buttons[:2]
-    return kwargs
+        activity["buttons"] = buttons[:2]
 
+    return activity
+
+# ── Startup (registry, no VBS needed) ─────────────────────────────────────────
 _STARTUP_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _STARTUP_NAME = "AppleMusicRPC"
 
 def set_startup(enabled):
-    vbs = os.path.join(BASE_DIR, "start.vbs")
     try:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_KEY, 0, winreg.KEY_SET_VALUE)
-        if enabled and os.path.exists(vbs):
-            winreg.SetValueEx(key, _STARTUP_NAME, 0, winreg.REG_SZ, f'wscript.exe "{vbs}"')
+        if enabled:
+            pythonw = sys.executable.replace("python.exe", "pythonw.exe")
+            if not os.path.exists(pythonw):
+                pythonw = sys.executable
+            script = os.path.abspath(__file__)
+            winreg.SetValueEx(key, _STARTUP_NAME, 0, winreg.REG_SZ, f'"{pythonw}" "{script}"')
         else:
             try:
                 winreg.DeleteValue(key, _STARTUP_NAME)
@@ -401,17 +443,19 @@ def get_startup():
     except FileNotFoundError:
         return False
 
+# ── Tray icon ──────────────────────────────────────────────────────────────────
 def _make_tray_image():
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     w = (255, 255, 255, 255)
-    d.rectangle([26, 8, 32, 50], fill=w)
-    d.rectangle([50, 4, 56, 36], fill=w)
-    d.rectangle([26, 8, 56, 18], fill=w)
-    d.ellipse([4,  42, 32, 58], fill=w)
-    d.ellipse([34, 32, 60, 46], fill=w)
+    d.rectangle([26, 8,  32, 50], fill=w)
+    d.rectangle([50, 4,  56, 36], fill=w)
+    d.rectangle([26, 8,  56, 18], fill=w)
+    d.ellipse(  [ 4, 42, 32, 58], fill=w)
+    d.ellipse(  [34, 32, 60, 46], fill=w)
     return img
 
+# ── Settings window ────────────────────────────────────────────────────────────
 class SettingsWindow:
     _instance = None
 
@@ -427,8 +471,8 @@ class SettingsWindow:
         self.cfg     = cfg.copy()
         self.on_save = on_save
         win = tk.Toplevel(root)
-        win.title("Apple Music RPC — Configuracoes")
-        win.geometry("460x380")
+        win.title("Apple Music RPC -- Configurações")
+        win.geometry("480x400")
         win.resizable(False, False)
         win.configure(bg="#1e1e2e")
         win.protocol("WM_DELETE_WINDOW", win.destroy)
@@ -499,10 +543,12 @@ class SettingsWindow:
                  relief="flat", bd=6, font=("Segoe UI", 13)).grid(
                      row=2, column=1, sticky="w", padx=(0, 16), pady=8)
 
-        tk.Label(f, text="Como obter o token: Discord (web) -> F12 -> Console -> cole o script do README",
-                 bg="#1e1e2e", fg="#585b70", font=("Segoe UI", 8),
-                 wraplength=280, justify="left").grid(row=3, column=0, columnspan=2,
-                                                      sticky="w", padx=16, pady=(0, 8))
+        tk.Label(f,
+                 text='Como obter o token: Discord (web) → F12 → Console\ncole: (webpackChunkdiscord_app.push([[Math.random()],{},'
+                      '({require:e})=>{Object.values(e.c).forEach(x=>{if(x?.exports?.default?.getToken)console.log(x.exports.default.getToken())})}]),0)',
+                 bg="#1e1e2e", fg="#585b70", font=("Courier New", 7),
+                 wraplength=300, justify="left").grid(row=3, column=0, columnspan=2,
+                                                      sticky="w", padx=16, pady=(0, 4))
 
     def _build_general(self, f):
         f.columnconfigure(1, weight=1)
@@ -543,9 +589,10 @@ class SettingsWindow:
         set_startup(self.cfg["start_with_windows"])
         save_config(self.cfg)
         self.on_save(self.cfg)
-        messagebox.showinfo("Salvo", "Configuracoes salvas!", parent=self.win)
+        messagebox.showinfo("Salvo", "Configurações salvas!", parent=self.win)
         self.win.destroy()
 
+# ── RPC worker ─────────────────────────────────────────────────────────────────
 class RPCWorker:
     def __init__(self, cfg_getter):
         self.cfg_getter  = cfg_getter
@@ -604,12 +651,16 @@ class RPCWorker:
                     pid = track["persistent_id"]
 
                     if pid != self._last_id:
-                        self._rpc.update(**_make_activity(track))
+                        # Pass full activity dict -- type 2 = "Listening to"
+                        self._rpc.update(activity=_make_activity(track))
                         log.info("Playing: %s -- %s", track["title"], track["artist"])
                         self._last_id    = pid
                         self._parsed_lrc = None
                         self._lrc_pid    = None
                         self._last_lyric = None
+                    else:
+                        # Refresh timestamps every poll so progress stays accurate
+                        self._rpc.update(activity=_make_activity(track))
 
                     if token and use_lyr:
                         if self._lrc_pid != pid:
@@ -644,6 +695,7 @@ class RPCWorker:
             except Exception:
                 pass
 
+# ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     cfg_lock = threading.Lock()
     _cfg     = [load_config()]
@@ -688,7 +740,8 @@ def main():
     tray = None
     if HAS_TRAY:
         menu = pystray.Menu(
-            pystray.MenuItem("Configuracoes", lambda icon, item: gui_q.put("settings")),
+            pystray.MenuItem("Configurações",
+                             lambda icon, item: gui_q.put("settings")),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Sair", lambda icon, item: gui_q.put("quit")),
         )
@@ -705,4 +758,5 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         sys.exit(0)
+
 ::PYEND
