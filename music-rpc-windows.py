@@ -51,6 +51,7 @@ FAST_CHECK_INTERVAL = 0.25
 INACTIVE_CHECK_INTERVAL = 0.5
 EVENT_FALLBACK_INTERVAL = 1.0
 LYRIC_DISPLAY_LEAD = 0.8  # seconds to send update early to compensate Discord display latency
+STATUS_MIN_INTERVAL = 15.0
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE     = os.path.join(BASE_DIR, "config.json")
 CACHE_FILE      = os.path.join(BASE_DIR, "cache.sqlite3")
@@ -254,9 +255,21 @@ def get_current_lyric(parsed_lrc: list, elapsed: float):
     return current
 
 # ── Discord custom status ──────────────────────────────────────────────────────
+_status_lock = threading.Lock()
+_status_next_allowed_at = 0.0
+_status_last_payload = None
+
 def _discord_patch(token: str, payload: dict):
+    global _status_next_allowed_at, _status_last_payload
     if not token:
-        return
+        return False
+    now = time.time()
+    with _status_lock:
+        if payload == _status_last_payload:
+            return True
+        if now < _status_next_allowed_at:
+            return False
+        _status_next_allowed_at = now + STATUS_MIN_INTERVAL
     data = json.dumps(payload).encode("utf-8")
     req  = urllib.request.Request(
         "https://discord.com/api/v9/users/@me/settings",
@@ -271,10 +284,27 @@ def _discord_patch(token: str, payload: dict):
     try:
         with urllib.request.urlopen(req, timeout=1.0):
             pass
+        with _status_lock:
+            _status_last_payload = payload
+        return True
     except urllib.error.HTTPError as e:
-        log.warning("Discord status HTTP %s", e.code)
+        retry_after = e.headers.get("Retry-After")
+        if retry_after:
+            try:
+                wait = float(retry_after)
+            except ValueError:
+                wait = 30.0
+        else:
+            wait = 30.0 if e.code == 429 else STATUS_MIN_INTERVAL
+        with _status_lock:
+            _status_next_allowed_at = time.time() + wait
+        log.warning("Discord status HTTP %s; retry in %.1fs", e.code, wait)
+        return False
     except Exception as e:
         log.warning("Discord status error: %s", e)
+        with _status_lock:
+            _status_next_allowed_at = time.time() + STATUS_MIN_INTERVAL
+        return False
 
 def set_discord_status(token: str, text: str, emoji: str = "\U0001f3b5"):
     custom_status = {"text": text[:128], "expires_at": None}
@@ -1091,9 +1121,9 @@ class RPCWorker:
 
                         lyric = get_current_lyric(self._parsed_lrc, track.get("position", 0))
                         if lyric and lyric != self._last_lyric:
-                            set_discord_status_async(token, lyric, emoji)
-                            log.info("Lyric: %s", lyric[:60])
-                            self._last_lyric = lyric
+                            if set_discord_status(token, lyric, emoji):
+                                log.info("Lyric: %s", lyric[:60])
+                                self._last_lyric = lyric
 
             except InvalidPipe:
                 log.warning("Lost Discord connection, reconnecting...")
@@ -1125,9 +1155,9 @@ class RPCWorker:
                     pos   = t.get("position", 0.0)
                     lyric = get_current_lyric(self._parsed_lrc, pos)
                     if lyric and lyric != self._last_lyric:
-                        set_discord_status_async(token, lyric, emoji)
-                        log.info("Lyric: %s", lyric[:60])
-                        self._last_lyric = lyric
+                        if set_discord_status(token, lyric, emoji):
+                            log.info("Lyric: %s", lyric[:60])
+                            self._last_lyric = lyric
                     wait = min(_time_until_next_lyric(self._parsed_lrc, pos),
                                EVENT_FALLBACK_INTERVAL, deadline - time.time())
                 else:
