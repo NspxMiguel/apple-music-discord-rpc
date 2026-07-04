@@ -89,6 +89,7 @@ DEFAULT_CONFIG = {
     "discord_token": "",
     "rpc_enabled": True,
     "lyrics_in_status": True,
+    "lyrics_in_rpc": True,
     "lyrics_emoji": "\U0001f3b5",
     "poll_interval": DEFAULT_TIMEOUT,
     "start_with_windows": True,
@@ -505,7 +506,7 @@ def _make_activity(track: dict, country: str = "US") -> dict:
 
     return activity
 
-def _make_activity_kwargs(track: dict, country: str = "US") -> dict:
+def _make_activity_kwargs(track: dict, country: str = "US", lyric: str | None = None) -> dict:
     extras = get_cached_extras(track["persistent_id"], country)
     pos = track.get("position", 0.0)
     dur = track.get("duration", 0.0)
@@ -514,7 +515,7 @@ def _make_activity_kwargs(track: dict, country: str = "US") -> dict:
     kwargs = {
         "activity_type": ActivityType.LISTENING,
         "details": _ensure_len(track["title"]),
-        "state": _ensure_len(track["artist"] or "Unknown Artist"),
+        "state": _ensure_len(lyric or track["artist"] or "Unknown Artist"),
         "start": math.ceil(now - pos),
     }
     if dur > 0:
@@ -524,6 +525,8 @@ def _make_activity_kwargs(track: dict, country: str = "US") -> dict:
     if artwork:
         kwargs["large_image"] = artwork
         kwargs["large_text"] = _ensure_len(track["album"] or f'{track["title"]} - {track["artist"]}')
+    elif lyric and track["artist"]:
+        kwargs["large_text"] = _ensure_len(track["artist"])
 
     buttons = []
     if extras.get("trackViewUrl"):
@@ -565,6 +568,7 @@ def _reset_track_state(worker):
     worker._parsed_lrc = None
     worker._lrc_pid    = None
     worker._last_lyric = None
+    worker._last_rpc_lyric = None
     worker._lyrics_loading_id = None
     worker._last_activity_key = None
     worker._force_activity_refresh_id = None
@@ -930,6 +934,7 @@ class RPCWorker:
         self._rpc        = None
         self._last_id    = None
         self._last_lyric = None
+        self._last_rpc_lyric = None
         self._parsed_lrc = None
         self._lrc_pid    = None
         self._lyrics_loading_id = None
@@ -941,6 +946,15 @@ class RPCWorker:
         self._activity_active = False
         self._last_activity_key = None
         self._force_activity_refresh_id = None
+
+    def _send_rpc_lyric(self, track: dict, country: str, lyric: str):
+        if not self._rpc or not self._activity_active:
+            return
+        if lyric == self._last_rpc_lyric:
+            return
+        self._rpc.update(**_make_activity_kwargs(track, country, lyric))
+        self._last_rpc_lyric = lyric
+        log.info("RPC lyric: %s", lyric[:60])
 
     def _start_lyrics_load(self, track: dict):
         pid = track["persistent_id"]
@@ -1029,6 +1043,7 @@ class RPCWorker:
             token    = cfg.get("discord_token", "")
             rpc_on   = cfg.get("rpc_enabled", True)
             use_lyr  = cfg.get("lyrics_in_status", True)
+            rpc_lyr  = cfg.get("lyrics_in_rpc", True)
             emoji    = cfg.get("lyrics_emoji", "\U0001f3b5")
             country  = cfg.get("itunes_country", "US")
 
@@ -1104,6 +1119,7 @@ class RPCWorker:
                             self._parsed_lrc = None
                             self._lrc_pid    = None
                             self._last_lyric = None
+                            self._last_rpc_lyric = None
                             if token and use_lyr:
                                 clear_discord_status_async(token)
                     elif pid != self._last_id:
@@ -1112,18 +1128,22 @@ class RPCWorker:
                         self._parsed_lrc = None
                         self._lrc_pid    = None
                         self._last_lyric = None
+                        self._last_rpc_lyric = None
                         if token and use_lyr:
                             clear_discord_status_async(token)
 
-                    if token and use_lyr:
+                    if (token and use_lyr) or rpc_lyr:
                         if self._lrc_pid != pid:
                             self._start_lyrics_load(track)
 
                         lyric = get_current_lyric(self._parsed_lrc, track.get("position", 0))
                         if lyric and lyric != self._last_lyric:
-                            if set_discord_status(token, lyric, emoji):
-                                log.info("Lyric: %s", lyric[:60])
-                                self._last_lyric = lyric
+                            if rpc_lyr:
+                                self._send_rpc_lyric(track, country, lyric)
+                            if token and use_lyr:
+                                set_discord_status(token, lyric, emoji)
+                            log.info("Lyric: %s", lyric[:60])
+                            self._last_lyric = lyric
 
             except InvalidPipe:
                 log.warning("Lost Discord connection, reconnecting...")
@@ -1139,7 +1159,7 @@ class RPCWorker:
                 continue
 
             # Unified wait loop: detects song change quickly and syncs lyrics precisely
-            has_lyrics = bool(token and use_lyr and self._parsed_lrc and self._last_id)
+            has_lyrics = bool(((token and use_lyr) or rpc_lyr) and self._parsed_lrc and self._last_id)
             deadline   = time.time() + EVENT_FALLBACK_INTERVAL
             while not self._stop.is_set() and time.time() < deadline:
                 try:
@@ -1155,9 +1175,12 @@ class RPCWorker:
                     pos   = t.get("position", 0.0)
                     lyric = get_current_lyric(self._parsed_lrc, pos)
                     if lyric and lyric != self._last_lyric:
-                        if set_discord_status(token, lyric, emoji):
-                            log.info("Lyric: %s", lyric[:60])
-                            self._last_lyric = lyric
+                        if rpc_lyr:
+                            self._send_rpc_lyric(t, country, lyric)
+                        if token and use_lyr:
+                            set_discord_status(token, lyric, emoji)
+                        log.info("Lyric: %s", lyric[:60])
+                        self._last_lyric = lyric
                     wait = min(_time_until_next_lyric(self._parsed_lrc, pos),
                                EVENT_FALLBACK_INTERVAL, deadline - time.time())
                 else:
