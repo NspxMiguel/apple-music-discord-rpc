@@ -12,6 +12,7 @@ import sys
 import logging
 import urllib.request
 import urllib.parse
+import urllib.error
 import sqlite3
 import os
 import re
@@ -29,7 +30,7 @@ try:
 except ImportError:
     HAS_TRAY = False
 
-from pypresence import Presence, InvalidPipe
+from pypresence import Presence, InvalidPipe, ActivityType
 from winrt.windows.media.control import (
     GlobalSystemMediaTransportControlsSessionManager as MediaManager,
     GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus,
@@ -46,10 +47,21 @@ CLIENT_ID       = "773825528921849856"
 VERSION         = "1.4"
 DEFAULT_TIMEOUT = 15
 MAX_RUNTIME     = 24 * 3600
-LYRIC_DISPLAY_LEAD = 2.0  # seconds to send update early to compensate Discord display latency
+FAST_CHECK_INTERVAL = 0.25
+INACTIVE_CHECK_INTERVAL = 0.5
+EVENT_FALLBACK_INTERVAL = 1.0
+LYRIC_DISPLAY_LEAD = 0.8  # seconds to send update early to compensate Discord display latency
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE     = os.path.join(BASE_DIR, "config.json")
 CACHE_FILE      = os.path.join(BASE_DIR, "cache.sqlite3")
+LOG_FILE        = os.path.join(BASE_DIR, "apple-music-rpc.log")
+
+_file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+_file_handler.setFormatter(logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+))
+logging.getLogger().addHandler(_file_handler)
 
 TOKEN_SCRIPT = (
     "(webpackChunkdiscord_app.push([[Math.random()],{},"
@@ -188,6 +200,20 @@ def fetch_extras(pid: str, name: str, artist: str, album: str, country: str = "U
         _extras_set(cache_key, extras)  # only cache on success
     return extras
 
+def get_cached_extras(pid: str, country: str = "US") -> dict:
+    return _extras_get(f"{pid}|{country}") or {}
+
+def prefetch_extras(pid: str, name: str, artist: str, album: str, country: str = "US", on_done=None):
+    if get_cached_extras(pid, country):
+        return
+
+    def load():
+        extras = fetch_extras(pid, name, artist, album, country)
+        if extras and on_done:
+            on_done()
+
+    threading.Thread(target=load, daemon=True).start()
+
 # ── Lyrics ─────────────────────────────────────────────────────────────────────
 def fetch_lyrics(pid: str, name: str, artist: str, album: str) -> dict:
     cached = _lyrics_get(pid)
@@ -217,6 +243,8 @@ def parse_lrc(lrc_text: str) -> list:
     return sorted(lines, key=lambda x: x[0])
 
 def get_current_lyric(parsed_lrc: list, elapsed: float):
+    if not parsed_lrc:
+        return None
     current = None
     for t, text in parsed_lrc:
         if t <= elapsed:
@@ -241,18 +269,30 @@ def _discord_patch(token: str, payload: dict):
         method="PATCH",
     )
     try:
-        with urllib.request.urlopen(req, timeout=5):
+        with urllib.request.urlopen(req, timeout=1.0):
             pass
+    except urllib.error.HTTPError as e:
+        log.warning("Discord status HTTP %s", e.code)
     except Exception as e:
-        log.debug("Discord status error: %s", e)
+        log.warning("Discord status error: %s", e)
 
 def set_discord_status(token: str, text: str, emoji: str = "\U0001f3b5"):
-    _discord_patch(token, {"custom_status": {
-        "text": text[:128], "emoji_name": emoji, "expires_at": None,
-    }})
+    custom_status = {"text": text[:128], "expires_at": None}
+    if emoji:
+        custom_status["emoji_name"] = emoji
+    _discord_patch(token, {"custom_status": custom_status})
 
 def clear_discord_status(token: str):
     _discord_patch(token, {"custom_status": None})
+
+def _run_daemon(fn, *args):
+    threading.Thread(target=fn, args=args, daemon=True).start()
+
+def set_discord_status_async(token: str, text: str, emoji: str = "\U0001f3b5"):
+    _run_daemon(set_discord_status, token, text, emoji)
+
+def clear_discord_status_async(token: str):
+    _run_daemon(clear_discord_status, token)
 
 # ── Windows Media Session ──────────────────────────────────────────────────────
 def _is_apple_music(source: str) -> bool:
@@ -273,7 +313,8 @@ async def _get_track() -> dict | None:
         if s not in candidates:
             candidates.append(s)
 
-    for session in candidates:
+    tracks = []
+    for idx, session in enumerate(candidates):
         source = session.source_app_user_model_id or ""
         if not _is_apple_music(source):
             continue
@@ -295,6 +336,13 @@ async def _get_track() -> dict | None:
             artist, album = artist.split(" — ", 1)
             artist = artist.strip()
             album  = album.strip()
+        if not album:
+            for sep in (" — ", " – ", " - "):
+                if sep in artist:
+                    artist, album = artist.split(sep, 1)
+                    artist = artist.strip()
+                    album  = album.strip()
+                    break
 
         position = 0.0
         duration = 0.0
@@ -310,7 +358,7 @@ async def _get_track() -> dict | None:
         except Exception:
             pass
 
-        return {
+        tracks.append({
             "persistent_id": f"{title}|{artist}|{album}",
             "title":    title,
             "artist":   artist,
@@ -319,18 +367,65 @@ async def _get_track() -> dict | None:
             "paused":   status == PlaybackStatus.PAUSED,
             "position": position,
             "duration": duration,
-        }
-    return None
+            "_session_order": idx,
+        })
+
+    if not tracks:
+        return None
+
+    playing = [t for t in tracks if t["playing"]]
+    if playing:
+        return playing[0]
+    return tracks[0]
+
+class MediaSessionWatcher:
+    def __init__(self, wake_event: threading.Event):
+        self.wake_event = wake_event
+        self.manager = None
+        self._manager_tokens = []
+        self._session_tokens = {}
+
+    async def start(self):
+        self.manager = await MediaManager.request_async()
+        self._manager_tokens.append(
+            ("current_session_changed", self.manager.add_current_session_changed(self._changed))
+        )
+        self._manager_tokens.append(
+            ("sessions_changed", self.manager.add_sessions_changed(self._changed))
+        )
+        self.refresh_sessions()
+
+    def _changed(self, sender=None, args=None):
+        self.wake_event.set()
+
+    def refresh_sessions(self):
+        if not self.manager:
+            return
+        sessions = []
+        cur = self.manager.get_current_session()
+        if cur:
+            sessions.append(cur)
+        for session in self.manager.get_sessions():
+            if session not in sessions:
+                sessions.append(session)
+        for session in sessions:
+            source = session.source_app_user_model_id or ""
+            if _is_apple_music(source):
+                self._register_session(session)
+
+    def _register_session(self, session):
+        key = id(session)
+        if key in self._session_tokens:
+            return
+        self._session_tokens[key] = (
+            session,
+            session.add_media_properties_changed(self._changed),
+            session.add_playback_info_changed(self._changed),
+        )
 
 # ── Activity builder ───────────────────────────────────────────────────────────
 def _make_activity(track: dict, country: str = "US") -> dict:
-    extras = fetch_extras(
-        track["persistent_id"],
-        track["title"],
-        track["artist"],
-        track["album"],
-        country,
-    )
+    extras = get_cached_extras(track["persistent_id"], country)
 
     pos = track.get("position", 0.0)
     dur = track.get("duration", 0.0)
@@ -352,7 +447,7 @@ def _make_activity(track: dict, country: str = "US") -> dict:
         activity["state"] = _ensure_len(track["artist"])
 
     artwork = extras.get("artworkUrl")
-    if track["album"] and extras:
+    if extras:
         if extras.get("trackViewUrl"):
             activity["details_url"] = extras["trackViewUrl"]
         if extras.get("artistViewUrl"):
@@ -360,8 +455,9 @@ def _make_activity(track: dict, country: str = "US") -> dict:
         if artwork:
             activity["assets"] = {
                 "large_image": artwork,
-                "large_text":  _ensure_len(track["album"]),
+                "large_text":  _ensure_len(track["album"] or f'{track["title"]} - {track["artist"]}'),
             }
+            log.debug("Artwork: %s", artwork)
             if extras.get("collectionViewUrl"):
                 activity["assets"]["large_url"] = extras["collectionViewUrl"]
 
@@ -378,6 +474,38 @@ def _make_activity(track: dict, country: str = "US") -> dict:
         activity["buttons"] = buttons[:2]
 
     return activity
+
+def _make_activity_kwargs(track: dict, country: str = "US") -> dict:
+    extras = get_cached_extras(track["persistent_id"], country)
+    pos = track.get("position", 0.0)
+    dur = track.get("duration", 0.0)
+    now = time.time()
+
+    kwargs = {
+        "activity_type": ActivityType.LISTENING,
+        "details": _ensure_len(track["title"]),
+        "state": _ensure_len(track["artist"] or "Unknown Artist"),
+        "start": math.ceil(now - pos),
+    }
+    if dur > 0:
+        kwargs["end"] = math.ceil(now - pos + dur)
+
+    artwork = extras.get("artworkUrl")
+    if artwork:
+        kwargs["large_image"] = artwork
+        kwargs["large_text"] = _ensure_len(track["album"] or f'{track["title"]} - {track["artist"]}')
+
+    buttons = []
+    if extras.get("trackViewUrl"):
+        buttons.append({"label": "Open in Apple Music", "url": extras["trackViewUrl"]})
+    sq = urllib.parse.quote(f'artist:{track["artist"]} track:{track["title"]}')
+    su = f"https://open.spotify.com/search/{sq}?si"
+    if len(su) <= 512:
+        buttons.append({"label": "Search on Spotify", "url": su})
+    if buttons:
+        kwargs["buttons"] = buttons[:2]
+
+    return kwargs
 
 # Send activity directly via IPC pipe (version-agnostic, supports undocumented fields)
 def _rpc_set_activity(rpc, activity: dict):
@@ -401,6 +529,26 @@ def _time_until_next_lyric(parsed_lrc: list, elapsed: float) -> float:
         if t > elapsed:
             return max(0.0, (t - elapsed) - LYRIC_DISPLAY_LEAD)
     return 30.0
+
+def _reset_track_state(worker):
+    worker._last_id    = None
+    worker._parsed_lrc = None
+    worker._lrc_pid    = None
+    worker._last_lyric = None
+    worker._lyrics_loading_id = None
+    worker._last_activity_key = None
+    worker._force_activity_refresh_id = None
+
+def _clear_presence(worker, token: str = "", clear_status: bool = True):
+    if worker._rpc:
+        try:
+            worker._rpc.clear()
+        except Exception:
+            pass
+    if token and clear_status:
+        clear_discord_status_async(token)
+    worker._activity_active = False
+    _reset_track_state(worker)
 
 # ── Startup ────────────────────────────────────────────────────────────────────
 _STARTUP_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -675,7 +823,7 @@ class SettingsWindow:
 
         self._row(f, "Poll interval (sec):", 0)
         self._poll_var = tk.IntVar(value=self.cfg.get("poll_interval", DEFAULT_TIMEOUT))
-        tk.Spinbox(f, from_=5, to=60, textvariable=self._poll_var, width=6,
+        tk.Spinbox(f, from_=1, to=60, textvariable=self._poll_var, width=6,
                    bg="#313244", fg="#cdd6f4", buttonbackground="#45475a",
                    relief="flat", font=("Segoe UI", 10)).grid(
                        row=0, column=1, sticky="w", padx=(0, 16), pady=7)
@@ -754,12 +902,67 @@ class RPCWorker:
         self._last_lyric = None
         self._parsed_lrc = None
         self._lrc_pid    = None
+        self._lyrics_loading_id = None
         self._start_time = time.time()
         self._stop       = threading.Event()
+        self._media_changed = threading.Event()
         self._loop       = None
+        self._watcher    = None
+        self._activity_active = False
+        self._last_activity_key = None
+        self._force_activity_refresh_id = None
+
+    def _start_lyrics_load(self, track: dict):
+        pid = track["persistent_id"]
+        if self._lrc_pid == pid or self._lyrics_loading_id == pid:
+            return
+        self._lyrics_loading_id = pid
+
+        def load():
+            try:
+                ly = fetch_lyrics(pid, track["title"], track["artist"], track["album"])
+                synced = ly.get("synced")
+                parsed = parse_lrc(synced) if synced else []
+                if parsed:
+                    log.info("Lyrics loaded: %s lines for %s", len(parsed), pid)
+                else:
+                    log.info("No synced lyrics found for %s", pid)
+            except Exception as e:
+                log.debug("Lyrics load error: %s", e)
+                parsed = []
+            if self._last_id == pid:
+                self._parsed_lrc = parsed
+                self._lrc_pid = pid
+                self._media_changed.set()
+            if self._lyrics_loading_id == pid:
+                self._lyrics_loading_id = None
+
+        threading.Thread(target=load, daemon=True).start()
+
+    def _schedule_timing_refresh(self, pid: str):
+        def refresh():
+            time.sleep(0.8)
+            if self._last_id == pid and not self._stop.is_set():
+                self._force_activity_refresh_id = pid
+                self._media_changed.set()
+
+        threading.Thread(target=refresh, daemon=True).start()
 
     def stop(self):
         self._stop.set()
+        self._media_changed.set()
+
+    def _wait_for_media_event(self, timeout: float):
+        timeout = max(0.0, float(timeout))
+        self._media_changed.clear()
+        deadline = time.time() + timeout
+        while not self._stop.is_set():
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return
+            if self._media_changed.wait(min(remaining, 0.25)):
+                self._media_changed.clear()
+                return
 
     def run(self):
         # Initialize COM as Single-Threaded Apartment for WinRT in this thread
@@ -771,6 +974,12 @@ class RPCWorker:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         try:
+            try:
+                self._watcher = MediaSessionWatcher(self._media_changed)
+                self._loop.run_until_complete(self._watcher.start())
+                log.info("Watching Windows Media Session events.")
+            except Exception as e:
+                log.warning("Media event watcher unavailable, using fallback polling: %s", e)
             self._main_loop()
         finally:
             self._loop.close()
@@ -786,7 +995,7 @@ class RPCWorker:
                 os.execv(sys.executable, [sys.executable] + sys.argv)
 
             cfg      = self.cfg_getter()
-            interval = cfg.get("poll_interval", DEFAULT_TIMEOUT)
+            interval = max(FAST_CHECK_INTERVAL, float(cfg.get("poll_interval", DEFAULT_TIMEOUT)))
             token    = cfg.get("discord_token", "")
             rpc_on   = cfg.get("rpc_enabled", True)
             use_lyr  = cfg.get("lyrics_in_status", True)
@@ -800,7 +1009,7 @@ class RPCWorker:
                 except Exception:
                     pass
                 self._rpc     = None
-                self._last_id = None
+                _reset_track_state(self)
 
             if rpc_on and self._rpc is None:
                 try:
@@ -808,49 +1017,65 @@ class RPCWorker:
                     self._rpc.connect()
                     log.info("Connected to Discord RPC.")
                 except InvalidPipe:
-                    log.warning("Discord not running, retry in %ds...", interval)
-                    self._stop.wait(interval)
+                    log.warning("Discord not running, retry in %.1fs...", interval)
+                    self._stop.wait(min(interval, INACTIVE_CHECK_INTERVAL))
                     continue
                 except Exception as e:
                     log.error("RPC connect error: %s", e)
                     self._rpc = None
-                    self._stop.wait(interval)
+                    self._stop.wait(min(interval, INACTIVE_CHECK_INTERVAL))
                     continue
 
             try:
+                if self._watcher:
+                    self._watcher.refresh_sessions()
                 track = self._loop.run_until_complete(_get_track())
             except Exception as e:
                 log.debug("Track fetch error: %s", e)
                 track = None
 
-            next_poll = _next_interval(track, interval)
-
             try:
                 if not track or not track["playing"]:
-                    if self._last_id is not None:
-                        if self._rpc:
-                            self._rpc.clear()
-                        reason = "paused" if (track and track["paused"]) else "stopped"
+                    reason = "paused" if (track and track["paused"]) else "stopped"
+                    if self._activity_active or self._last_id is not None:
                         log.info("Cleared (%s).", reason)
-                        self._last_id    = None
-                        self._parsed_lrc = None
-                        self._lrc_pid    = None
-                        self._last_lyric = None
-                        if token and use_lyr:
-                            clear_discord_status(token)
+                    _clear_presence(self, token, token and use_lyr)
                 else:
                     pid = track["persistent_id"]
 
                     if self._rpc:
-                        _rpc_set_activity(self._rpc, _make_activity(track, country))
+                        extras = get_cached_extras(pid, country)
+                        activity_key = (pid, extras.get("artworkUrl", ""), round(track.get("duration", 0.0)))
+                        force_activity_refresh = self._force_activity_refresh_id == pid
+                        should_update_activity = (
+                            pid != self._last_id
+                            or activity_key != self._last_activity_key
+                            or force_activity_refresh
+                        )
+                        if should_update_activity:
+                            self._rpc.update(**_make_activity_kwargs(track, country))
+                            self._activity_active = True
+                            self._last_activity_key = activity_key
+                            if force_activity_refresh:
+                                self._force_activity_refresh_id = None
+                            log.info("RPC update sent: %s", pid)
                         if pid != self._last_id:
                             log.info("Playing: %s — %s", track["title"], track["artist"])
+                            self._schedule_timing_refresh(pid)
+                            prefetch_extras(
+                                pid,
+                                track["title"],
+                                track["artist"],
+                                track["album"],
+                                country,
+                                self._media_changed.set,
+                            )
                             self._last_id    = pid
                             self._parsed_lrc = None
                             self._lrc_pid    = None
                             self._last_lyric = None
                             if token and use_lyr:
-                                clear_discord_status(token)
+                                clear_discord_status_async(token)
                     elif pid != self._last_id:
                         log.info("Playing (RPC off): %s — %s", track["title"], track["artist"])
                         self._last_id    = pid
@@ -858,61 +1083,63 @@ class RPCWorker:
                         self._lrc_pid    = None
                         self._last_lyric = None
                         if token and use_lyr:
-                            clear_discord_status(token)
+                            clear_discord_status_async(token)
 
                     if token and use_lyr:
                         if self._lrc_pid != pid:
-                            ly     = fetch_lyrics(pid, track["title"], track["artist"], track["album"])
-                            synced = ly.get("synced")
-                            self._parsed_lrc = parse_lrc(synced) if synced else []
-                            self._lrc_pid    = pid
+                            self._start_lyrics_load(track)
 
                         lyric = get_current_lyric(self._parsed_lrc, track.get("position", 0))
                         if lyric and lyric != self._last_lyric:
-                            set_discord_status(token, lyric, emoji)
+                            set_discord_status_async(token, lyric, emoji)
                             log.info("Lyric: %s", lyric[:60])
                             self._last_lyric = lyric
 
             except InvalidPipe:
                 log.warning("Lost Discord connection, reconnecting...")
                 self._rpc     = None
-                self._last_id = None
+                self._activity_active = False
+                _reset_track_state(self)
             except Exception as e:
                 log.error("Presence update error: %s", e)
+                self._wait_for_media_event(INACTIVE_CHECK_INTERVAL)
+
+            if not track or not track["playing"]:
+                self._wait_for_media_event(INACTIVE_CHECK_INTERVAL)
+                continue
 
             # Unified wait loop: detects song change quickly and syncs lyrics precisely
             has_lyrics = bool(token and use_lyr and self._parsed_lrc and self._last_id)
-            deadline   = time.time() + next_poll
+            deadline   = time.time() + EVENT_FALLBACK_INTERVAL
             while not self._stop.is_set() and time.time() < deadline:
                 try:
                     t = self._loop.run_until_complete(_get_track())
                 except Exception:
-                    self._stop.wait(min(2.0, deadline - time.time()))
+                    self._stop.wait(min(INACTIVE_CHECK_INTERVAL, deadline - time.time()))
                     continue
                 if not t or not t["playing"]:
-                    self._stop.wait(min(2.0, deadline - time.time()))
-                    continue
+                    break  # Paused, stopped, or Apple Music closed: clear on the next loop now.
                 if t["persistent_id"] != self._last_id:
                     break  # Song changed — exit immediately so main loop updates RPC
                 if has_lyrics:
                     pos   = t.get("position", 0.0)
                     lyric = get_current_lyric(self._parsed_lrc, pos)
                     if lyric and lyric != self._last_lyric:
-                        set_discord_status(token, lyric, emoji)
+                        set_discord_status_async(token, lyric, emoji)
                         log.info("Lyric: %s", lyric[:60])
                         self._last_lyric = lyric
                     wait = min(_time_until_next_lyric(self._parsed_lrc, pos),
-                               2.0, deadline - time.time())
+                               EVENT_FALLBACK_INTERVAL, deadline - time.time())
                 else:
-                    wait = min(0.5, deadline - time.time())
+                    wait = min(EVENT_FALLBACK_INTERVAL, deadline - time.time())
                 if wait <= 0:
                     break
-                self._stop.wait(wait)
+                self._wait_for_media_event(wait)
 
         cfg   = self.cfg_getter()
         token = cfg.get("discord_token", "")
         if token:
-            clear_discord_status(token)
+            clear_discord_status_async(token)
         if self._rpc:
             try:
                 self._rpc.clear()

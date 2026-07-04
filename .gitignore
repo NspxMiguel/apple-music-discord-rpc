@@ -1,2 +1,10 @@
 /cache_v?.sqlite3*
 /music-rpc.log
+cache.sqlite3
+*.log
+config.json
+__pycache__/
+build/
+dist/
+run-fixed-backup.ps1
+test-*.log
