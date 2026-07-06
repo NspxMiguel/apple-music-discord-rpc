@@ -1218,15 +1218,15 @@ class RPCWorker:
                 self._wait_for_media_event(INACTIVE_CHECK_INTERVAL)
                 continue
 
-            # Unified wait loop: lyrics use estimated position (no WinRT calls during sleep).
-            # _get_track() is only called when a real media event fires (song change, etc.)
+            # Lyrics path: precise timing loop with estimated position.
+            # No-lyrics path: single wait, zero WinRT calls — outer loop handles state.
             has_lyrics = bool((use_lyr or rpc_lyr) and self._parsed_lrc and self._last_id)
-            pos0     = track.get("position", 0.0)
-            t0       = time.time()
-            deadline = t0 + EVENT_FALLBACK_INTERVAL
-            while not self._stop.is_set() and time.time() < deadline:
-                est_pos = pos0 + (time.time() - t0)
-                if has_lyrics:
+            if has_lyrics:
+                pos0     = track.get("position", 0.0)
+                t0       = time.time()
+                deadline = t0 + EVENT_FALLBACK_INTERVAL
+                while not self._stop.is_set() and time.time() < deadline:
+                    est_pos = pos0 + (time.time() - t0)
                     lyric = get_current_lyric(self._parsed_lrc, est_pos)
                     if lyric and lyric != self._last_lyric:
                         if rpc_lyr:
@@ -1237,23 +1237,23 @@ class RPCWorker:
                         self._last_lyric = lyric
                     wait = min(_time_until_next_lyric(self._parsed_lrc, est_pos),
                                EVENT_FALLBACK_INTERVAL, deadline - time.time())
-                else:
-                    wait = min(EVENT_FALLBACK_INTERVAL, deadline - time.time())
-                if wait <= 0:
-                    break
-                fired = self._wait_for_media_event(wait)
-                if fired:
-                    # Re-query WinRT only when media session signals a real change
-                    try:
-                        _mgr = self._watcher.manager if self._watcher else None
-                        t = self._loop.run_until_complete(_get_track(_mgr))
-                    except Exception:
+                    if wait <= 0:
                         break
-                    if not t or not t["playing"] or t["persistent_id"] != self._last_id:
-                        break
-                    pos0  = t.get("position", 0.0)
-                    t0    = time.time()
-                    track = t
+                    fired = self._wait_for_media_event(wait)
+                    if fired:
+                        try:
+                            _mgr = self._watcher.manager if self._watcher else None
+                            t = self._loop.run_until_complete(_get_track(_mgr))
+                        except Exception:
+                            break
+                        if not t or not t["playing"] or t["persistent_id"] != self._last_id:
+                            break
+                        pos0, t0, track = t.get("position", 0.0), time.time(), t
+            else:
+                # No lyrics active: one sleep, no _get_track() at all.
+                # An early event (song change, stop) wakes us so the outer loop
+                # re-checks promptly; otherwise we wait the full fallback interval.
+                self._wait_for_media_event(EVENT_FALLBACK_INTERVAL)
 
         cfg   = self.cfg_getter()
         token = cfg.get("discord_token", "")
@@ -1281,7 +1281,11 @@ def main():
     def set_cfg(new_cfg):
         with cfg_lock:
             _cfg[0] = new_cfg
-        # Reset lyric state so the current line is re-sent with the new settings immediately
+        # Always clear custom status on save so a stale lyric never lingers;
+        # it will be re-sent on the next loop cycle if lyrics are still enabled
+        token = new_cfg.get("discord_token", "")
+        if token:
+            clear_discord_status_async(token)
         worker._last_lyric = None
         worker._last_rpc_lyric = None
         worker._media_changed.set()
