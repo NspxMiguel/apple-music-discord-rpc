@@ -91,6 +91,7 @@ DEFAULT_CONFIG = {
     "lyrics_in_status": True,
     "lyrics_in_rpc": True,
     "lyrics_emoji": "\U0001f3b5",
+    "hide_game_activity": False,
     "poll_interval": DEFAULT_TIMEOUT,
     "start_with_windows": True,
     "itunes_country": "US",
@@ -307,11 +308,12 @@ def _discord_patch(token: str, payload: dict):
             _status_next_allowed_at = time.time() + STATUS_MIN_INTERVAL
         return False
 
-def _restore_game_activity(token: str):
-    """Restore show_current_game in case a previous run crashed while hiding it."""
+_GAME_HIDDEN_SENTINEL = os.path.join(BASE_DIR, ".game_hidden")
+
+def _set_show_game(token: str, show: bool):
     if not token:
         return
-    data = json.dumps({"show_current_game": True}).encode("utf-8")
+    data = json.dumps({"show_current_game": show}).encode("utf-8")
     req = urllib.request.Request(
         "https://discord.com/api/v9/users/@me/settings",
         data=data,
@@ -325,9 +327,20 @@ def _restore_game_activity(token: str):
     try:
         with urllib.request.urlopen(req, timeout=5.0):
             pass
-        log.info("Discord activity visibility restored.")
+        if show:
+            try:
+                os.unlink(_GAME_HIDDEN_SENTINEL)
+            except FileNotFoundError:
+                pass
+            log.info("Game activity restored.")
+        else:
+            try:
+                open(_GAME_HIDDEN_SENTINEL, "w").close()
+            except Exception:
+                pass
+            log.info("Game activity hidden.")
     except Exception as e:
-        log.debug("Activity restore error: %s", e)
+        log.debug("show_current_game patch error: %s", e)
 
 def set_discord_status(token: str, text: str, emoji: str = "\U0001f3b5"):
     custom_status = {"text": text[:128], "expires_at": None}
@@ -840,12 +853,16 @@ class SettingsWindow:
         self._rpc_lyr_var = tk.BooleanVar(value=self.cfg.get("lyrics_in_rpc", True))
         self._check(f, self._rpc_lyr_var, 4)
 
-        self._row(f, "Lyrics emoji:", 5)
+        self._row(f, "Hide game activity:", 5)
+        self._hide_game_var = tk.BooleanVar(value=self.cfg.get("hide_game_activity", False))
+        self._check(f, self._hide_game_var, 5)
+
+        self._row(f, "Lyrics emoji:", 6)
         self._emoji_var = tk.StringVar(value=self.cfg.get("lyrics_emoji", "\U0001f3b5"))
         tk.Entry(f, textvariable=self._emoji_var, width=5,
                  bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4",
                  relief="flat", bd=6, font=("Segoe UI", 13)).grid(
-                     row=5, column=1, sticky="w", padx=(0, 16), pady=7)
+                     row=6, column=1, sticky="w", padx=(0, 16), pady=7)
 
     def _build_general(self, f):
         f.columnconfigure(1, weight=1)
@@ -913,6 +930,7 @@ class SettingsWindow:
         self.cfg["rpc_enabled"]        = self._rpc_var.get()
         self.cfg["lyrics_in_status"]   = self._lyr_var.get()
         self.cfg["lyrics_in_rpc"]      = self._rpc_lyr_var.get()
+        self.cfg["hide_game_activity"] = self._hide_game_var.get()
         self.cfg["lyrics_emoji"]       = self._emoji_var.get()
         self.cfg["poll_interval"]      = self._poll_var.get()
         self.cfg["start_with_windows"] = self._start_var.get()
@@ -943,6 +961,7 @@ class RPCWorker:
         self._last_activity_key = None
         self._force_activity_refresh_id = None
         self._last_session_refresh = 0.0
+        self._game_hidden = False
 
     def _send_rpc_lyric(self, track: dict, country: str, lyric: str):
         if not self._rpc or not self._activity_active:
@@ -992,6 +1011,11 @@ class RPCWorker:
     def stop(self):
         self._stop.set()
         self._media_changed.set()
+        if self._game_hidden:
+            token = self.cfg_getter().get("discord_token", "")
+            if token:
+                _set_show_game(token, True)
+            self._game_hidden = False
 
     def _wait_for_media_event(self, timeout: float) -> bool:
         """Sleep up to timeout seconds. Returns True if a media event fired early."""
@@ -1027,11 +1051,11 @@ class RPCWorker:
                 pass
 
     def _main_loop(self):
-        # Restore show_current_game in case previous run crashed while hiding it
+        # Restore show_current_game if a previous run crashed while hiding it
         _startup_cfg = self.cfg_getter()
         _startup_token = _startup_cfg.get("discord_token", "")
-        if _startup_token:
-            _run_daemon(_restore_game_activity, _startup_token)
+        if _startup_token and os.path.exists(_GAME_HIDDEN_SENTINEL):
+            _run_daemon(_set_show_game, _startup_token, True)
 
         while not self._stop.is_set():
             if time.time() - self._start_time >= MAX_RUNTIME:
@@ -1046,6 +1070,7 @@ class RPCWorker:
             rpc_lyr   = cfg.get("lyrics_in_rpc", True)
             emoji     = cfg.get("lyrics_emoji", "\U0001f3b5")
             country   = cfg.get("itunes_country", "US")
+            hide_game = cfg.get("hide_game_activity", False)
 
             if not rpc_on and self._rpc is not None:
                 try:
@@ -1157,6 +1182,15 @@ class RPCWorker:
                 log.error("Presence update error: %s", e)
                 self._wait_for_media_event(INACTIVE_CHECK_INTERVAL)
 
+            # Toggle game activity visibility
+            should_hide = hide_game and bool(track and track["playing"]) and bool(token)
+            if should_hide and not self._game_hidden:
+                _run_daemon(_set_show_game, token, False)
+                self._game_hidden = True
+            elif not should_hide and self._game_hidden:
+                _run_daemon(_set_show_game, token, True)
+                self._game_hidden = False
+
             if not track or not track["playing"]:
                 self._wait_for_media_event(INACTIVE_CHECK_INTERVAL)
                 continue
@@ -1202,6 +1236,9 @@ class RPCWorker:
         token = cfg.get("discord_token", "")
         if token:
             clear_discord_status_async(token)
+        if self._game_hidden and token:
+            _set_show_game(token, True)
+            self._game_hidden = False
         if self._rpc:
             try:
                 self._rpc.clear()
