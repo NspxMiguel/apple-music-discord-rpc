@@ -1144,7 +1144,7 @@ class RPCWorker:
                             if rpc_lyr:
                                 self._send_rpc_lyric(track, country, lyric)
                             if token and use_lyr:
-                                set_discord_status(token, lyric, emoji)
+                                _run_daemon(set_discord_status, token, lyric, emoji)
                             log.info("Lyric: %s", lyric[:60])
                             self._last_lyric = lyric
 
@@ -1211,6 +1211,14 @@ class RPCWorker:
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
+    # Run at below-normal priority so we never compete with games for CPU
+    try:
+        handle = ctypes.windll.kernel32.OpenProcess(0x0200, False, os.getpid())
+        ctypes.windll.kernel32.SetPriorityClass(handle, 0x00004000)  # BELOW_NORMAL_PRIORITY_CLASS
+        ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+
     cfg_lock = threading.Lock()
     _cfg     = [load_config()]
 
