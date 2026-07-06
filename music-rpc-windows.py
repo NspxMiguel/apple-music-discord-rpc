@@ -5,6 +5,7 @@ Based on https://github.com/NextFire/apple-music-discord-rpc
 """
 
 import asyncio
+import datetime
 import json
 import math
 import time
@@ -387,6 +388,21 @@ async def _get_track(mgr=None) -> dict | None:
             if tl:
                 position = _ticks_to_sec(tl.position)
                 duration = _ticks_to_sec(tl.end_time)
+                # Apple Music freezes tl.position; reconstruct from last_updated_time
+                if status == PlaybackStatus.PLAYING:
+                    try:
+                        lut = tl.last_updated_time
+                        if lut is not None:
+                            now_utc = datetime.datetime.now(datetime.timezone.utc)
+                            if getattr(lut, "tzinfo", None) is None:
+                                lut = lut.replace(tzinfo=datetime.timezone.utc)
+                            elapsed = (now_utc - lut).total_seconds()
+                            if 0 < elapsed < 3600:
+                                position = position + elapsed
+                                if duration > 0:
+                                    position = min(position, duration)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -1153,7 +1169,7 @@ class RPCWorker:
                         if rpc_lyr:
                             self._send_rpc_lyric(track, country, lyric)
                         if token and use_lyr:
-                            set_discord_status(token, lyric, emoji)
+                            _run_daemon(set_discord_status, token, lyric, emoji)
                         log.info("Lyric: %s", lyric[:60])
                         self._last_lyric = lyric
                     wait = min(_time_until_next_lyric(self._parsed_lrc, est_pos),
