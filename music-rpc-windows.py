@@ -451,7 +451,8 @@ class MediaSessionWatcher:
         self._session_tokens[key] = (
             session,
             session.add_media_properties_changed(self._changed),
-            session.add_playback_info_changed(self._changed),
+            # playback_info_changed fires every ~1s for position updates — omit to avoid
+            # hammering _get_track() in a tight loop; pause/stop is caught by the fallback poll
         )
 
 # ── Activity builder ───────────────────────────────────────────────────────────
@@ -946,6 +947,7 @@ class RPCWorker:
         self._activity_active = False
         self._last_activity_key = None
         self._force_activity_refresh_id = None
+        self._last_session_refresh = 0.0
 
     def _send_rpc_lyric(self, track: dict, country: str, lyric: str):
         if not self._rpc or not self._activity_active:
@@ -996,17 +998,14 @@ class RPCWorker:
         self._stop.set()
         self._media_changed.set()
 
-    def _wait_for_media_event(self, timeout: float):
+    def _wait_for_media_event(self, timeout: float) -> bool:
+        """Sleep up to timeout seconds. Returns True if a media event fired early."""
         timeout = max(0.0, float(timeout))
         self._media_changed.clear()
-        deadline = time.time() + timeout
-        while not self._stop.is_set():
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                return
-            if self._media_changed.wait(min(remaining, 0.25)):
-                self._media_changed.clear()
-                return
+        fired = self._media_changed.wait(timeout)
+        if fired:
+            self._media_changed.clear()
+        return fired
 
     def run(self):
         # Initialize COM as Single-Threaded Apartment for WinRT in this thread
@@ -1072,8 +1071,10 @@ class RPCWorker:
                     continue
 
             try:
-                if self._watcher:
+                _now = time.time()
+                if self._watcher and _now - self._last_session_refresh > 5.0:
                     self._watcher.refresh_sessions()
+                    self._last_session_refresh = _now
                 track = self._loop.run_until_complete(_get_track())
             except Exception as e:
                 log.debug("Track fetch error: %s", e)
@@ -1158,36 +1159,41 @@ class RPCWorker:
                 self._wait_for_media_event(INACTIVE_CHECK_INTERVAL)
                 continue
 
-            # Unified wait loop: detects song change quickly and syncs lyrics precisely
+            # Unified wait loop: lyrics use estimated position (no WinRT calls during sleep).
+            # _get_track() is only called when a real media event fires (song change, etc.)
             has_lyrics = bool(((token and use_lyr) or rpc_lyr) and self._parsed_lrc and self._last_id)
-            deadline   = time.time() + EVENT_FALLBACK_INTERVAL
+            pos0     = track.get("position", 0.0)
+            t0       = time.time()
+            deadline = t0 + EVENT_FALLBACK_INTERVAL
             while not self._stop.is_set() and time.time() < deadline:
-                try:
-                    t = self._loop.run_until_complete(_get_track())
-                except Exception:
-                    self._stop.wait(min(INACTIVE_CHECK_INTERVAL, deadline - time.time()))
-                    continue
-                if not t or not t["playing"]:
-                    break  # Paused, stopped, or Apple Music closed: clear on the next loop now.
-                if t["persistent_id"] != self._last_id:
-                    break  # Song changed — exit immediately so main loop updates RPC
+                est_pos = pos0 + (time.time() - t0)
                 if has_lyrics:
-                    pos   = t.get("position", 0.0)
-                    lyric = get_current_lyric(self._parsed_lrc, pos)
+                    lyric = get_current_lyric(self._parsed_lrc, est_pos)
                     if lyric and lyric != self._last_lyric:
                         if rpc_lyr:
-                            self._send_rpc_lyric(t, country, lyric)
+                            self._send_rpc_lyric(track, country, lyric)
                         if token and use_lyr:
                             set_discord_status(token, lyric, emoji)
                         log.info("Lyric: %s", lyric[:60])
                         self._last_lyric = lyric
-                    wait = min(_time_until_next_lyric(self._parsed_lrc, pos),
+                    wait = min(_time_until_next_lyric(self._parsed_lrc, est_pos),
                                EVENT_FALLBACK_INTERVAL, deadline - time.time())
                 else:
                     wait = min(EVENT_FALLBACK_INTERVAL, deadline - time.time())
                 if wait <= 0:
                     break
-                self._wait_for_media_event(wait)
+                fired = self._wait_for_media_event(wait)
+                if fired:
+                    # Re-query WinRT only when media session signals a real change
+                    try:
+                        t = self._loop.run_until_complete(_get_track())
+                    except Exception:
+                        break
+                    if not t or not t["playing"] or t["persistent_id"] != self._last_id:
+                        break
+                    pos0  = t.get("position", 0.0)
+                    t0    = time.time()
+                    track = t
 
         cfg   = self.cfg_getter()
         token = cfg.get("discord_token", "")
