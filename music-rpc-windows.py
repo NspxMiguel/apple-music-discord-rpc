@@ -30,7 +30,7 @@ try:
 except ImportError:
     HAS_TRAY = False
 
-from pypresence import Presence, InvalidPipe, ActivityType
+from pypresence import Presence, InvalidPipe
 from winrt.windows.media.control import (
     GlobalSystemMediaTransportControlsSessionManager as MediaManager,
     GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus,
@@ -91,7 +91,6 @@ DEFAULT_CONFIG = {
     "lyrics_in_status": True,
     "lyrics_in_rpc": True,
     "lyrics_emoji": "\U0001f3b5",
-    "hide_game_activity": False,
     "poll_interval": DEFAULT_TIMEOUT,
     "start_with_windows": True,
     "itunes_country": "US",
@@ -308,14 +307,11 @@ def _discord_patch(token: str, payload: dict):
             _status_next_allowed_at = time.time() + STATUS_MIN_INTERVAL
         return False
 
-_game_hidden_lock = threading.Lock()
-_game_hidden_state = False  # tracks whether WE hid the game activity
-
-def _toggle_game_activity(token: str, show: bool):
-    global _game_hidden_state
+def _restore_game_activity(token: str):
+    """Restore show_current_game in case a previous run crashed while hiding it."""
     if not token:
         return
-    data = json.dumps({"show_current_game": show}).encode("utf-8")
+    data = json.dumps({"show_current_game": True}).encode("utf-8")
     req = urllib.request.Request(
         "https://discord.com/api/v9/users/@me/settings",
         data=data,
@@ -329,11 +325,9 @@ def _toggle_game_activity(token: str, show: bool):
     try:
         with urllib.request.urlopen(req, timeout=5.0):
             pass
-        with _game_hidden_lock:
-            _game_hidden_state = not show
-        log.info("Game activity %s.", "restored" if show else "hidden")
+        log.info("Discord activity visibility restored.")
     except Exception as e:
-        log.warning("Game activity toggle error: %s", e)
+        log.debug("Activity restore error: %s", e)
 
 def set_discord_status(token: str, text: str, emoji: str = "\U0001f3b5"):
     custom_status = {"text": text[:128], "expires_at": None}
@@ -485,7 +479,7 @@ class MediaSessionWatcher:
         )
 
 # ── Activity builder ───────────────────────────────────────────────────────────
-def _make_activity(track: dict, country: str = "US") -> dict:
+def _make_activity(track: dict, country: str = "US", lyric: str | None = None) -> dict:
     extras = get_cached_extras(track["persistent_id"], country)
 
     pos = track.get("position", 0.0)
@@ -503,9 +497,10 @@ def _make_activity(track: dict, country: str = "US") -> dict:
     if end_ts:
         activity["timestamps"]["end"] = end_ts
 
-    if track["artist"]:
+    state = lyric or track["artist"]
+    if state:
         activity["status_display_type"] = 1
-        activity["state"] = _ensure_len(track["artist"])
+        activity["state"] = _ensure_len(state)
 
     artwork = extras.get("artworkUrl")
     if extras:
@@ -535,40 +530,6 @@ def _make_activity(track: dict, country: str = "US") -> dict:
         activity["buttons"] = buttons[:2]
 
     return activity
-
-def _make_activity_kwargs(track: dict, country: str = "US", lyric: str | None = None) -> dict:
-    extras = get_cached_extras(track["persistent_id"], country)
-    pos = track.get("position", 0.0)
-    dur = track.get("duration", 0.0)
-    now = time.time()
-
-    kwargs = {
-        "activity_type": ActivityType.LISTENING,
-        "details": _ensure_len(track["title"]),
-        "state": _ensure_len(lyric or track["artist"] or "Unknown Artist"),
-        "start": math.ceil(now - pos),
-    }
-    if dur > 0:
-        kwargs["end"] = math.ceil(now - pos + dur)
-
-    artwork = extras.get("artworkUrl")
-    if artwork:
-        kwargs["large_image"] = artwork
-        kwargs["large_text"] = _ensure_len(track["album"] or f'{track["title"]} - {track["artist"]}')
-    elif lyric and track["artist"]:
-        kwargs["large_text"] = _ensure_len(track["artist"])
-
-    buttons = []
-    if extras.get("trackViewUrl"):
-        buttons.append({"label": "Open in Apple Music", "url": extras["trackViewUrl"]})
-    sq = urllib.parse.quote(f'artist:{track["artist"]} track:{track["title"]}')
-    su = f"https://open.spotify.com/search/{sq}?si"
-    if len(su) <= 512:
-        buttons.append({"label": "Search on Spotify", "url": su})
-    if buttons:
-        kwargs["buttons"] = buttons[:2]
-
-    return kwargs
 
 # Send activity directly via IPC pipe (version-agnostic, supports undocumented fields)
 def _rpc_set_activity(rpc, activity: dict):
@@ -879,19 +840,12 @@ class SettingsWindow:
         self._rpc_lyr_var = tk.BooleanVar(value=self.cfg.get("lyrics_in_rpc", True))
         self._check(f, self._rpc_lyr_var, 4)
 
-        self._row(f, "Hide game activity:", 5)
-        self._hide_game_var = tk.BooleanVar(value=self.cfg.get("hide_game_activity", False))
-        self._check(f, self._hide_game_var, 5)
-        tk.Label(f, text="Hides all games and shows only music while playing",
-                 bg="#1e1e2e", fg="#585b70", font=("Segoe UI", 8)).grid(
-                     row=6, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 4))
-
-        self._row(f, "Lyrics emoji:", 7)
+        self._row(f, "Lyrics emoji:", 5)
         self._emoji_var = tk.StringVar(value=self.cfg.get("lyrics_emoji", "\U0001f3b5"))
         tk.Entry(f, textvariable=self._emoji_var, width=5,
                  bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4",
                  relief="flat", bd=6, font=("Segoe UI", 13)).grid(
-                     row=7, column=1, sticky="w", padx=(0, 16), pady=7)
+                     row=5, column=1, sticky="w", padx=(0, 16), pady=7)
 
     def _build_general(self, f):
         f.columnconfigure(1, weight=1)
@@ -959,7 +913,6 @@ class SettingsWindow:
         self.cfg["rpc_enabled"]        = self._rpc_var.get()
         self.cfg["lyrics_in_status"]   = self._lyr_var.get()
         self.cfg["lyrics_in_rpc"]      = self._rpc_lyr_var.get()
-        self.cfg["hide_game_activity"] = self._hide_game_var.get()
         self.cfg["lyrics_emoji"]       = self._emoji_var.get()
         self.cfg["poll_interval"]      = self._poll_var.get()
         self.cfg["start_with_windows"] = self._start_var.get()
@@ -990,14 +943,13 @@ class RPCWorker:
         self._last_activity_key = None
         self._force_activity_refresh_id = None
         self._last_session_refresh = 0.0
-        self._game_hidden = False
 
     def _send_rpc_lyric(self, track: dict, country: str, lyric: str):
         if not self._rpc or not self._activity_active:
             return
         if lyric == self._last_rpc_lyric:
             return
-        self._rpc.update(**_make_activity_kwargs(track, country, lyric))
+        _rpc_set_activity(self._rpc, _make_activity(track, country, lyric))
         self._last_rpc_lyric = lyric
         log.info("RPC lyric: %s", lyric[:60])
 
@@ -1040,11 +992,6 @@ class RPCWorker:
     def stop(self):
         self._stop.set()
         self._media_changed.set()
-        if self._game_hidden:
-            token = self.cfg_getter().get("discord_token", "")
-            if token:
-                _toggle_game_activity(token, True)
-            self._game_hidden = False
 
     def _wait_for_media_event(self, timeout: float) -> bool:
         """Sleep up to timeout seconds. Returns True if a media event fired early."""
@@ -1080,6 +1027,12 @@ class RPCWorker:
                 pass
 
     def _main_loop(self):
+        # Restore show_current_game in case previous run crashed while hiding it
+        _startup_cfg = self.cfg_getter()
+        _startup_token = _startup_cfg.get("discord_token", "")
+        if _startup_token:
+            _run_daemon(_restore_game_activity, _startup_token)
+
         while not self._stop.is_set():
             if time.time() - self._start_time >= MAX_RUNTIME:
                 log.info("Max runtime reached, restarting...")
@@ -1093,7 +1046,6 @@ class RPCWorker:
             rpc_lyr   = cfg.get("lyrics_in_rpc", True)
             emoji     = cfg.get("lyrics_emoji", "\U0001f3b5")
             country   = cfg.get("itunes_country", "US")
-            hide_game = cfg.get("hide_game_activity", False)
 
             if not rpc_on and self._rpc is not None:
                 try:
@@ -1149,7 +1101,7 @@ class RPCWorker:
                             or force_activity_refresh
                         )
                         if should_update_activity:
-                            self._rpc.update(**_make_activity_kwargs(track, country))
+                            _rpc_set_activity(self._rpc, _make_activity(track, country))
                             self._activity_active = True
                             self._last_activity_key = activity_key
                             if force_activity_refresh:
@@ -1205,15 +1157,6 @@ class RPCWorker:
                 log.error("Presence update error: %s", e)
                 self._wait_for_media_event(INACTIVE_CHECK_INTERVAL)
 
-            # Toggle Discord game activity visibility based on option + playback state
-            should_hide = hide_game and bool(track and track["playing"]) and bool(token)
-            if should_hide and not self._game_hidden:
-                _run_daemon(_toggle_game_activity, token, False)
-                self._game_hidden = True
-            elif not should_hide and self._game_hidden:
-                _run_daemon(_toggle_game_activity, token, True)
-                self._game_hidden = False
-
             if not track or not track["playing"]:
                 self._wait_for_media_event(INACTIVE_CHECK_INTERVAL)
                 continue
@@ -1259,9 +1202,6 @@ class RPCWorker:
         token = cfg.get("discord_token", "")
         if token:
             clear_discord_status_async(token)
-        if self._game_hidden and token:
-            _toggle_game_activity(token, True)
-            self._game_hidden = False
         if self._rpc:
             try:
                 self._rpc.clear()
