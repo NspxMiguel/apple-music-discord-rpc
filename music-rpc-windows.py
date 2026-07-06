@@ -48,8 +48,8 @@ VERSION         = "1.4"
 DEFAULT_TIMEOUT = 15
 MAX_RUNTIME     = 24 * 3600
 FAST_CHECK_INTERVAL = 0.25
-INACTIVE_CHECK_INTERVAL = 0.5
-EVENT_FALLBACK_INTERVAL = 1.0
+INACTIVE_CHECK_INTERVAL = 2.0
+EVENT_FALLBACK_INTERVAL = 5.0
 LYRIC_DISPLAY_LEAD = 0.8  # seconds to send update early to compensate Discord display latency
 STATUS_MIN_INTERVAL = 1.5
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
@@ -357,9 +357,10 @@ def clear_discord_status_async(token: str):
 def _is_apple_music(source: str) -> bool:
     return any(k in source.lower() for k in ["applemusic", "apple music", "itunes"])
 
-async def _get_track() -> dict | None:
+async def _get_track(mgr=None) -> dict | None:
     try:
-        sessions = await MediaManager.request_async()
+        # Reuse a cached manager when available — avoids the expensive request_async() call
+        sessions = mgr or await MediaManager.request_async()
     except Exception as e:
         log.debug("MediaManager: %s", e)
         return None
@@ -1123,7 +1124,8 @@ class RPCWorker:
                 if self._watcher and _now - self._last_session_refresh > 5.0:
                     self._watcher.refresh_sessions()
                     self._last_session_refresh = _now
-                track = self._loop.run_until_complete(_get_track())
+                _mgr  = self._watcher.manager if self._watcher else None
+                track = self._loop.run_until_complete(_get_track(_mgr))
             except Exception as e:
                 log.debug("Track fetch error: %s", e)
                 track = None
@@ -1243,7 +1245,8 @@ class RPCWorker:
                 if fired:
                     # Re-query WinRT only when media session signals a real change
                     try:
-                        t = self._loop.run_until_complete(_get_track())
+                        _mgr = self._watcher.manager if self._watcher else None
+                        t = self._loop.run_until_complete(_get_track(_mgr))
                     except Exception:
                         break
                     if not t or not t["playing"] or t["persistent_id"] != self._last_id:
