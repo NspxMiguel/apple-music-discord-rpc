@@ -846,12 +846,16 @@ class SettingsWindow:
         self._lyr_var = tk.BooleanVar(value=self.cfg.get("lyrics_in_status", True))
         self._check(f, self._lyr_var, 3)
 
-        self._row(f, "Lyrics emoji:", 4)
+        self._row(f, "Lyrics in Rich Presence:", 4)
+        self._rpc_lyr_var = tk.BooleanVar(value=self.cfg.get("lyrics_in_rpc", True))
+        self._check(f, self._rpc_lyr_var, 4)
+
+        self._row(f, "Lyrics emoji:", 5)
         self._emoji_var = tk.StringVar(value=self.cfg.get("lyrics_emoji", "\U0001f3b5"))
         tk.Entry(f, textvariable=self._emoji_var, width=5,
                  bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4",
                  relief="flat", bd=6, font=("Segoe UI", 13)).grid(
-                     row=4, column=1, sticky="w", padx=(0, 16), pady=7)
+                     row=5, column=1, sticky="w", padx=(0, 16), pady=7)
 
     def _build_general(self, f):
         f.columnconfigure(1, weight=1)
@@ -918,6 +922,7 @@ class SettingsWindow:
         self.cfg["discord_token"]      = self._tok_var.get().strip()
         self.cfg["rpc_enabled"]        = self._rpc_var.get()
         self.cfg["lyrics_in_status"]   = self._lyr_var.get()
+        self.cfg["lyrics_in_rpc"]      = self._rpc_lyr_var.get()
         self.cfg["lyrics_emoji"]       = self._emoji_var.get()
         self.cfg["poll_interval"]      = self._poll_var.get()
         self.cfg["start_with_windows"] = self._start_var.get()
@@ -1133,7 +1138,7 @@ class RPCWorker:
                         if token and use_lyr:
                             clear_discord_status_async(token)
 
-                    if (token and use_lyr) or rpc_lyr:
+                    if use_lyr or rpc_lyr:
                         if self._lrc_pid != pid:
                             self._start_lyrics_load(track)
 
@@ -1161,7 +1166,7 @@ class RPCWorker:
 
             # Unified wait loop: lyrics use estimated position (no WinRT calls during sleep).
             # _get_track() is only called when a real media event fires (song change, etc.)
-            has_lyrics = bool(((token and use_lyr) or rpc_lyr) and self._parsed_lrc and self._last_id)
+            has_lyrics = bool((use_lyr or rpc_lyr) and self._parsed_lrc and self._last_id)
             pos0     = track.get("position", 0.0)
             t0       = time.time()
             deadline = t0 + EVENT_FALLBACK_INTERVAL
@@ -1218,6 +1223,10 @@ def main():
     def set_cfg(new_cfg):
         with cfg_lock:
             _cfg[0] = new_cfg
+        # Reset lyric state so the current line is re-sent with the new settings immediately
+        worker._last_lyric = None
+        worker._last_rpc_lyric = None
+        worker._media_changed.set()
 
     root = tk.Tk()
     root.withdraw()
