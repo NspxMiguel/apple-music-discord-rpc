@@ -1005,6 +1005,12 @@ class RPCWorker:
                 pass
 
     def _main_loop(self):
+        # Always restore show_current_game on startup to recover from unclean exits
+        _sc = self.cfg_getter()
+        _st = _sc.get("discord_token", "")
+        if _st:
+            _run_daemon(_discord_patch, _st, {"show_current_game": True})
+
         while not self._stop.is_set():
             if time.time() - self._start_time >= MAX_RUNTIME:
                 log.info("Max runtime reached, restarting...")
