@@ -1019,7 +1019,7 @@ class SettingsWindow:
                  font=("Segoe UI", 13, "bold")).pack()
         tk.Label(f, text="Windows port — based on NextFire/apple-music-discord-rpc",
                  bg="#1e1e2e", fg="#585b70", font=("Segoe UI", 9)).pack(pady=4)
-        tk.Label(f, text="github.com/spxmiguel/apple-music-discord-rpc",
+        tk.Label(f, text="github.com/NspxMiguel/apple-music-discord-rpc",
                  bg="#1e1e2e", fg="#89b4fa", font=("Segoe UI", 9)).pack()
 
     def _toggle_token(self):
