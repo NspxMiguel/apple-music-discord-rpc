@@ -11,11 +11,14 @@ Shows the currently playing Apple Music track in Discord Rich Presence with:
 - optional synced lyrics in Discord custom status via LRCLIB
 - automatic clear on pause, stop, or Apple Music close
 
-This Windows port uses the Windows Global System Media Transport Controls API to read Apple Music playback state.
+This Windows port uses the Windows Global System Media Transport Controls API to
+read Apple Music playback state.
 
 ## Status
 
-This is a Windows-specific port. The upstream maintainer does not currently review or merge Windows-specific code because they do not have a Windows environment.
+This is a Windows-specific port. The upstream maintainer does not currently
+review or merge Windows-specific code because they do not have a Windows
+environment.
 
 For the original macOS project, see:
 
@@ -42,7 +45,8 @@ Run:
 install-windows.bat
 ```
 
-The installer copies the script to `C:\apple-music-rpc`, installs Python dependencies, and adds a Windows startup entry.
+The installer copies the script to `C:\apple-music-rpc`, installs Python
+dependencies, and adds a Windows startup entry.
 
 For local testing from this repository:
 
@@ -59,13 +63,17 @@ The worker listens for Windows media session events:
 - `current_session_changed`
 - `sessions_changed`
 
-When Apple Music changes track, the app sends a Discord RPC update immediately. It then performs one short delayed refresh to correct the timestamp and duration after Windows finishes updating timeline metadata.
+When Apple Music changes track, the app sends a Discord RPC update immediately.
+It then performs one short delayed refresh to correct the timestamp and duration
+after Windows finishes updating timeline metadata.
 
-Artwork and lyrics are fetched in background threads so network calls do not block track changes.
+Artwork and lyrics are fetched in background threads so network calls do not
+block track changes.
 
 ## Lyrics In Discord Status
 
-Lyrics require a Discord user token because Discord's Rich Presence IPC cannot set a custom status. The token is used only to PATCH your own custom status.
+Lyrics require a Discord user token because Discord's Rich Presence IPC cannot
+set a custom status. The token is used only to PATCH your own custom status.
 
 Security notes:
 
@@ -91,11 +99,14 @@ The active process should point at the script you expect.
 
 ### Discord shows the old card
 
-The script may have already sent the update while Discord's profile popout is visually cached. Close and reopen the profile popout. The log file shows what the script actually sent.
+The script may have already sent the update while Discord's profile popout is
+visually cached. Close and reopen the profile popout. The log file shows what
+the script actually sent.
 
 ### Progress bar or duration is wrong after changing tracks
 
-Windows sometimes emits the new title before it emits the corrected timeline. The worker sends an immediate update, then a delayed one-time timing refresh.
+Windows sometimes emits the new title before it emits the corrected timeline.
+The worker sends an immediate update, then a delayed one-time timing refresh.
 
 ### No lyrics
 
@@ -149,4 +160,5 @@ Keep runtime files out of commits:
 - `build/`
 - `dist/`
 
-The Windows port is intentionally independent from the upstream macOS implementation because it relies on Windows media session APIs.
+The Windows port is intentionally independent from the upstream macOS
+implementation because it relies on Windows media session APIs.
